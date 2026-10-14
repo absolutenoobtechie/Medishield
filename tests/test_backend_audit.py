@@ -2,12 +2,15 @@
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
+from guard.approval import ApprovalAuthenticationError, compute_approval_mac
 from guard.audit import write_event
 from guard.intent import action_hash, canonicalize_action
 from guard.models import ProtectedAction
+from privacy.auth import authenticate_local
 from server import backend
 from server.db import initialize_db
 
@@ -38,39 +41,112 @@ def make_action(order_id="ORD-TEST-001"):
     )
 
 
+def _trusted_user(database_path, actor_id="clinician_1", org_id="ORG-DEMO"):
+    connection = initialize_db(database_path)
+    try:
+        return authenticate_local(connection, actor_id, org_id)
+    finally:
+        connection.close()
+
+
 def test_create_approval_stores_canonical_action_and_hash(isolated_database):
     database_path, _ = isolated_database
     action = make_action()
 
-    approval_id = backend.create_approval(action, "clinician_1", 5)
+    approval_id = backend.create_approval(
+        action,
+        "clinician_1",
+        5,
+        trusted_user=_trusted_user(database_path),
+    )
 
     with sqlite3.connect(database_path) as connection:
         row = connection.execute(
-            "SELECT action_json, action_hash, approver_id FROM approvals WHERE approval_id = ?",
+            """SELECT action_json, action_hash, approver_id, created_at,
+                      expires_at, approval_mac
+               FROM approvals WHERE approval_id = ?""",
             (approval_id,),
         ).fetchone()
-    assert row == (canonicalize_action(action), action_hash(action), "clinician_1")
+    assert row[:3] == (canonicalize_action(action), action_hash(action), "clinician_1")
+    assert row[5] == compute_approval_mac(
+        approval_id=approval_id,
+        action_json=row[0],
+        action_hash=row[1],
+        approver_id=row[2],
+        created_at=row[3],
+        expires_at=row[4],
+    )
+
+
+def test_create_approval_fails_closed_without_gateway_secret(
+    isolated_database, monkeypatch
+):
+    database_path, _ = isolated_database
+    monkeypatch.delenv("MEDISHIELD_APPROVAL_SECRET", raising=False)
+
+    with pytest.raises(ApprovalAuthenticationError):
+        backend.create_approval(
+            make_action(),
+            "clinician_1",
+            5,
+            trusted_user=_trusted_user(database_path),
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("approver_id", ["missing_actor", "nurse_1", "agent_1"])
 def test_create_approval_rejects_non_clinician_or_missing_actor(
     isolated_database, approver_id
 ):
+    database_path, _ = isolated_database
     with pytest.raises((LookupError, PermissionError, ValueError)):
-        backend.create_approval(make_action(), approver_id, 5)
+        trusted_actor = approver_id if approver_id != "missing_actor" else "clinician_1"
+        backend.create_approval(
+            make_action(),
+            approver_id,
+            5,
+            trusted_user=_trusted_user(database_path, trusted_actor),
+        )
 
 
 @pytest.mark.parametrize("ttl_minutes", [0, -1, "not-a-number"])
 def test_create_approval_rejects_non_positive_ttl(isolated_database, ttl_minutes):
+    database_path, _ = isolated_database
     with pytest.raises(ValueError):
-        backend.create_approval(make_action(), "clinician_1", ttl_minutes)
+        backend.create_approval(
+            make_action(),
+            "clinician_1",
+            ttl_minutes,
+            trusted_user=_trusted_user(database_path),
+        )
 
 
 def test_revoke_approval_marks_existing_row_and_rejects_unknown(isolated_database):
     database_path, _ = isolated_database
-    approval_id = backend.create_approval(make_action(), "clinician_1", 5)
+    approval_id = backend.create_approval(
+        make_action(),
+        "clinician_1",
+        5,
+        trusted_user=_trusted_user(database_path),
+    )
 
-    backend.revoke_approval(approval_id)
+    backend.revoke_approval(
+        approval_id,
+        trusted_user=_trusted_user(database_path),
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        events = connection.execute(
+            """SELECT action_type, approval_id, decision, state_changed
+               FROM audit_events ORDER BY id"""
+        ).fetchall()
+
+    assert [(row[0], row[1], row[2], row[3]) for row in events] == [
+        ("approval_created", approval_id, "allowed", 0),
+        ("approval_revoked", approval_id, "allowed", 0),
+    ]
     with sqlite3.connect(database_path) as connection:
         revoked = connection.execute(
             "SELECT revoked FROM approvals WHERE approval_id = ?", (approval_id,)
@@ -78,15 +154,66 @@ def test_revoke_approval_marks_existing_row_and_rejects_unknown(isolated_databas
     assert revoked == 1
 
     with pytest.raises(LookupError):
-        backend.revoke_approval("APR-UNKNOWN")
+        backend.revoke_approval(
+            "APR-UNKNOWN",
+            trusted_user=_trusted_user(database_path),
+        )
 
+
+def test_approval_lifecycle_events_are_audited(isolated_database):
+    database_path, _ = isolated_database
+    approval_id = backend.create_approval(
+        make_action(),
+        "clinician_1",
+        5,
+        trusted_user=_trusted_user(database_path),
+    )
+    backend.revoke_approval(
+        approval_id,
+        trusted_user=_trusted_user(database_path),
+    )
+
+
+def test_backend_patient_record_requires_authenticated_tenant_context(isolated_database):
+    database_path, _ = isolated_database
+    connection = initialize_db(database_path)
+    try:
+        with pytest.raises(PermissionError):
+            backend.get_patient_record("P-104", connection=connection)
+
+        user = authenticate_local(connection, "clinician_1", "ORG-DEMO")
+        patient = backend.get_patient_record(
+            "P-104",
+            connection=connection,
+            trusted_user=user,
+        )
+        assert patient["patient"]["patient_id"] == "P-104"
+
+        connection.execute(
+            "INSERT OR IGNORE INTO memberships(org_id, actor_id, role, active) VALUES (?, ?, ?, 1)",
+            ("ORG-SECOND", "clinician_1", "clinician"),
+        )
+        connection.commit()
+        other_tenant_user = authenticate_local(connection, "clinician_1", "ORG-SECOND")
+        with pytest.raises(PermissionError):
+            backend.get_patient_record(
+                "P-104",
+                connection=connection,
+                trusted_user=other_tenant_user,
+            )
+    finally:
+        connection.close()
 
 def test_apply_order_uses_caller_transaction(isolated_database):
     database_path, _ = isolated_database
     connection = initialize_db(database_path)
     action = make_action("ORD-TEST-002")
 
-    backend.apply_order(action, connection=connection)
+    backend.apply_order(
+        action,
+        connection=connection,
+        _gateway_token=backend._GATEWAY_EXECUTION_TOKEN,
+    )
     row = connection.execute(
         "SELECT order_id, patient_id FROM orders WHERE order_id = ?",
         (action.order_id,),
@@ -96,6 +223,31 @@ def test_apply_order_uses_caller_transaction(isolated_database):
         action.patient_id,
     )
     connection.rollback()
+    connection.close()
+
+
+def test_apply_order_rejects_missing_connection(isolated_database):
+    with pytest.raises(RuntimeError, match="requires the gateway transaction"):
+        backend.apply_order(make_action())
+
+
+def test_apply_order_rejects_direct_caller_without_gateway_capability(isolated_database):
+    database_path, _ = isolated_database
+    connection = initialize_db(database_path)
+    try:
+        with pytest.raises(PermissionError, match="restricted to the security gateway"):
+            backend.apply_order(make_action(), connection=connection)
+    finally:
+        connection.close()
+
+
+def test_backend_execute_cannot_bypass_gateway(isolated_database):
+    database_path, _ = isolated_database
+    connection = initialize_db(database_path)
+
+    with pytest.raises(PermissionError):
+        backend.execute(SimpleNamespace(action=make_action()), connection=connection)
+
     connection.close()
 
 

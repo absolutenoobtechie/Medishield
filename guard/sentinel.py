@@ -99,7 +99,7 @@ EXPECTED_TOOL_REGISTRY: tuple[dict[str, Any], ...] = (
     {
         "name": "request_clinician_approval",
         "title": None,
-        "description": "Create a clinician approval for the exact validated protected action.",
+        "description": "Create an approval only from a server-authenticated clinician context.",
         "inputSchema": _action_schema_with_properties(
             {
                 "action": {"$ref": "#/$defs/ProtectedAction"},
@@ -145,7 +145,7 @@ EXPECTED_TOOL_REGISTRY: tuple[dict[str, Any], ...] = (
     {
         "name": "get_security_events",
         "title": None,
-        "description": "Return the newest synthetic security audit events.",
+        "description": "Return security events visible to the authenticated audit role.",
         "inputSchema": _object_schema({"limit": {"type": "integer", "default": 20}}),
         "outputSchema": {
             "properties": {
@@ -287,7 +287,6 @@ def registry_json(registry: Any) -> str:
         allow_nan=False,
     )
 
-
 def registry_fingerprint(registry: Any) -> str:
     """Return the SHA-256 fingerprint of a canonical declared registry."""
 
@@ -334,8 +333,6 @@ def _context(result: TrustResult) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
 def audit_reason(result: TrustResult) -> str:
     """Add concise machine-readable sentinel context to a human explanation."""
 
@@ -418,3 +415,293 @@ def check_registry(observed_registry: Any = None) -> TrustResult:
         explanation=f"MCP tool registry drift detected: {difference_text}.",
         protected_execution_allowed=False,
     )
+
+
+import copy
+from dataclasses import asdict, field
+from datetime import datetime, timezone
+
+TRUSTED_MCP_TOOLS = list(EXPECTED_TOOL_REGISTRY)
+
+
+def compute_registry_fingerprint(tools: Any) -> str:
+    return registry_fingerprint(tools)
+
+
+EXPECTED_REGISTRY_FINGERPRINT = registry_fingerprint(EXPECTED_TOOL_REGISTRY)
+PREVIOUS_BENCHMARK_FINGERPRINT = "5b90a5d5c8d8bc1566eadc3a4eab7ac56b81caded9c5f5f1ed0c0ed2a8a45091"
+
+
+@dataclass
+class ToolIntegrityDetail:
+    name: str
+    expected_presence: bool
+    observed_presence: bool
+    status: str
+    schema_status: str
+    metadata_status: str
+    description: str
+    findings: str
+
+
+@dataclass
+class RegistryVerificationResult:
+    status: str
+    expected_fingerprint: str
+    observed_fingerprint: str
+    fingerprints_match: bool
+    expected_tools_count: int
+    observed_tools_count: int
+    expected_tools: list[str]
+    observed_tools: list[str]
+    missing_tools: list[str]
+    unexpected_tools: list[str]
+    modified_tools: list[str]
+    differences: list[str]
+    reason: str
+    verification_errors: list[str]
+    tool_details: list[ToolIntegrityDetail] = field(default_factory=list)
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def get_trusted_baseline_tools() -> list[dict[str, Any]]:
+    return copy.deepcopy(list(TRUSTED_MCP_TOOLS))
+
+
+def verify_registry(
+    observed_tools: Optional[list[dict[str, Any]]] = None,
+    expected_tools: Optional[list[dict[str, Any]]] = None,
+) -> RegistryVerificationResult:
+    """Build the dashboard-facing report from the live registry by default."""
+
+    baseline = expected_tools if expected_tools is not None else TRUSTED_MCP_TOOLS
+    expected_fp = compute_registry_fingerprint(baseline)
+    expected_map = {t["name"]: t for t in baseline}
+    expected_names = sorted(list(expected_map.keys()))
+
+    if observed_tools is None:
+        try:
+            observed_tools = canonicalize_registry(inspect_runtime_registry())
+        except Exception as exc:
+            error_msg = f"Unable to inspect the live MCP registry: {exc}"
+            return RegistryVerificationResult(
+                status="VERIFICATION ERROR",
+                expected_fingerprint=expected_fp,
+                observed_fingerprint="",
+                fingerprints_match=False,
+                expected_tools_count=len(expected_names),
+                observed_tools_count=0,
+                expected_tools=expected_names,
+                observed_tools=[],
+                missing_tools=expected_names,
+                unexpected_tools=[],
+                modified_tools=[],
+                differences=[error_msg],
+                reason=f"Registry verification failed: {error_msg}",
+                verification_errors=[error_msg],
+                tool_details=[],
+            )
+
+    differences: list[str] = []
+    errors: list[str] = []
+    tool_details: list[ToolIntegrityDetail] = []
+
+    if not isinstance(observed_tools, (list, tuple)):
+        error_msg = f"Observed tools registry must be a list, got {type(observed_tools).__name__}"
+        errors.append(error_msg)
+        return RegistryVerificationResult(
+            status="VERIFICATION ERROR",
+            expected_fingerprint=expected_fp,
+            observed_fingerprint="",
+            fingerprints_match=False,
+            expected_tools_count=len(expected_names),
+            observed_tools_count=0,
+            expected_tools=expected_names,
+            observed_tools=[],
+            missing_tools=expected_names,
+            unexpected_tools=[],
+            modified_tools=[],
+            differences=[error_msg],
+            reason=f"Registry verification failed: {error_msg}",
+            verification_errors=errors,
+            tool_details=[],
+        )
+
+    valid_observed: list[dict[str, Any]] = []
+    malformed_tools: list[str] = []
+    for idx, t in enumerate(observed_tools):
+        if not isinstance(t, dict):
+            malformed_tools.append(f"item[{idx}] (type {type(t).__name__})")
+            continue
+        if "name" not in t or not str(t["name"]).strip():
+            malformed_tools.append(f"item[{idx}] (missing name)")
+            continue
+        valid_observed.append(t)
+
+    if malformed_tools:
+        err = f"Malformed tool definitions detected: {', '.join(malformed_tools)}"
+        errors.append(err)
+        differences.append(err)
+
+    try:
+        valid_observed = canonicalize_registry(valid_observed)
+        observed_fp = compute_registry_fingerprint(valid_observed)
+    except Exception as exc:
+        err = f"Failed to compute observed registry fingerprint: {str(exc)}"
+        errors.append(err)
+        observed_fp = "MALFORMED_FINGERPRINT"
+
+    observed_map = {t["name"]: t for t in valid_observed}
+    observed_names = sorted(list(observed_map.keys()))
+
+    missing_tools = [name for name in expected_names if name not in observed_map]
+    unexpected_tools = [name for name in observed_names if name not in expected_map]
+    modified_tools: list[str] = []
+
+    renamed_pairs: dict[str, str] = {}
+    for m in missing_tools:
+        for u in unexpected_tools:
+            if m in u or u in m or "tamper" in u.lower():
+                renamed_pairs[m] = u
+                differences.append(
+                    f"Possible renamed tool detected: expected '{m}' appears replaced by '{u}'"
+                )
+
+    for name in expected_names:
+        if name in observed_map:
+            exp_t = expected_map[name]
+            obs_t = observed_map[name]
+            exp_schema = exp_t.get("inputSchema", {})
+            obs_schema = obs_t.get("inputSchema", {})
+            exp_output_schema = exp_t.get("outputSchema", {})
+            obs_output_schema = obs_t.get("outputSchema", {})
+            schema_match = json.dumps(exp_schema, sort_keys=True) == json.dumps(
+                obs_schema, sort_keys=True
+            )
+            output_schema_match = json.dumps(
+                exp_output_schema, sort_keys=True
+            ) == json.dumps(obs_output_schema, sort_keys=True)
+            exp_desc = exp_t.get("description", "").strip()
+            obs_desc = obs_t.get("description", "").strip()
+            desc_match = exp_desc == obs_desc
+            metadata_match = all(
+                exp_t.get(field) == obs_t.get(field)
+                for field in ("title", "annotations", "icons", "meta")
+            )
+
+            if not schema_match or not output_schema_match or not desc_match or not metadata_match:
+                modified_tools.append(name)
+                diff_parts = []
+                if not schema_match:
+                    diff_parts.append("inputSchema altered")
+                if not output_schema_match:
+                    diff_parts.append("outputSchema altered")
+                if not desc_match:
+                    diff_parts.append("description altered")
+                if not metadata_match:
+                    diff_parts.append("interface metadata altered")
+                differences.append(f"Tool '{name}' definition altered: {', '.join(diff_parts)}")
+
+    for m in missing_tools:
+        if m not in renamed_pairs:
+            differences.append(f"Expected tool '{m}' is missing from observed registry.")
+    for u in unexpected_tools:
+        if u not in renamed_pairs.values():
+            differences.append(f"Unexpected tool '{u}' was detected in observed registry.")
+
+    all_known_names = sorted(list(set(expected_names + observed_names)))
+    for name in all_known_names:
+        is_exp = name in expected_map
+        is_obs = name in observed_map
+
+        if is_exp and is_obs:
+            is_mod = name in modified_tools
+            if is_mod:
+                status = "SCHEMA_DRIFT"
+                schema_status = "MODIFIED"
+                meta_status = "MODIFIED"
+                findings = "Tool definition or schema altered from trusted baseline."
+            else:
+                status = "VERIFIED"
+                schema_status = "MATCH"
+                meta_status = "MATCH"
+                findings = "Cryptographic schema and metadata match trusted baseline."
+            desc = observed_map[name].get("description", expected_map[name].get("description", ""))
+        elif is_exp and not is_obs:
+            if name in renamed_pairs:
+                status = "RENAMED"
+                findings = f"Tool missing from registry (suspected rename to '{renamed_pairs[name]}')."
+            else:
+                status = "MISSING"
+                findings = "Expected tool is completely missing from observed registry."
+            schema_status = "MISSING"
+            meta_status = "MISSING"
+            desc = expected_map[name].get("description", "")
+        else:
+            status = "UNEXPECTED"
+            schema_status = "N/A"
+            meta_status = "N/A"
+            findings = "Unapproved tool introduced into registry without authorization."
+            desc = observed_map[name].get("description", "Unregistered external tool")
+
+        tool_details.append(
+            ToolIntegrityDetail(
+                name=name,
+                expected_presence=is_exp,
+                observed_presence=is_obs,
+                status=status,
+                schema_status=schema_status,
+                metadata_status=meta_status,
+                description=desc,
+                findings=findings,
+            )
+        )
+
+    fps_match = bool(
+        hmac.compare_digest(expected_fp, observed_fp)
+        and observed_fp != "MALFORMED_FINGERPRINT"
+    )
+
+    if errors:
+        status = "VERIFICATION ERROR"
+        reason = f"Verification error: {'; '.join(errors)}"
+    elif not fps_match or missing_tools or unexpected_tools or modified_tools:
+        status = "DRIFT DETECTED"
+        reasons = []
+        if missing_tools:
+            reasons.append(f"{len(missing_tools)} missing tool(s)")
+        if unexpected_tools:
+            reasons.append(f"{len(unexpected_tools)} unexpected tool(s)")
+        if modified_tools:
+            reasons.append(f"{len(modified_tools)} modified tool(s)")
+        if not fps_match:
+            reasons.append("SHA-256 fingerprint mismatch")
+        reason = f"Registry drift detected: {', '.join(reasons)}."
+    else:
+        status = "TRUSTED"
+        reason = "Tool registry matches authoritative baseline. All 5 tools verified."
+
+    return RegistryVerificationResult(
+        status=status,
+        expected_fingerprint=expected_fp,
+        observed_fingerprint=observed_fp,
+        fingerprints_match=fps_match,
+        expected_tools_count=len(expected_names),
+        observed_tools_count=len(observed_names),
+        expected_tools=expected_names,
+        observed_tools=observed_names,
+        missing_tools=missing_tools,
+        unexpected_tools=unexpected_tools,
+        modified_tools=modified_tools,
+        differences=differences,
+        reason=reason,
+        verification_errors=errors,
+        tool_details=tool_details,
+    )
+
+# End of the explicit reviewed registry verifier.
+
+# The file intentionally ends after the reviewed verifier.

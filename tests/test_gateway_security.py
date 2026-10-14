@@ -1,11 +1,11 @@
 """Integration tests for MediShield gateway security enforcement."""
 
-import json
 import sqlite3
 import pytest
 
+from guard.approval import compute_approval_mac
 from guard.gateway import verify_execution
-from guard.intent import action_hash
+from guard.intent import action_hash, canonicalize_action
 from guard.models import ExecutionRequest, ProtectedAction
 from server.db import init_db, seed_data
 
@@ -28,20 +28,34 @@ def test_db():
 def create_approval(conn, approval_id, action_dict, approver_id="clinician_1"):
     action_obj = ProtectedAction(**action_dict)
     h = action_hash(action_obj)
+    action_json = canonicalize_action(action_obj)
+    created_at = "2026-10-14T00:00:00Z"
+    expires_at = "2026-10-15T00:00:00Z"
+    approval_mac = compute_approval_mac(
+        approval_id=approval_id,
+        action_json=action_json,
+        action_hash=h,
+        approver_id=approver_id,
+        created_at=created_at,
+        expires_at=expires_at,
+    )
     conn.execute(
         """
-        INSERT INTO approvals (approval_id, action_hash, action_json, approver_id, created_at, expires_at, revoked, consumed)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO approvals (
+            approval_id, action_hash, action_json, approver_id, created_at,
+            expires_at, revoked, consumed, approval_mac
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             approval_id,
             h,
-            json.dumps(action_dict),
+            action_json,
             approver_id,
-            "2026-10-14T00:00:00Z",
-            "2026-10-15T00:00:00Z",
+            created_at,
+            expires_at,
             0,
             0,
+            approval_mac,
         ),
     )
     conn.commit()

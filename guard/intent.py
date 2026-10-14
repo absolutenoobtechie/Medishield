@@ -53,6 +53,16 @@ def _validated_values(action: ProtectedAction | Mapping[str, Any]) -> dict[str, 
 
 MAX_DOSE_STRING_LENGTH = 64
 MAX_DOSE_VALUE = Decimal("1000000")
+MAX_CANONICAL_DOSE_LENGTH = 128
+
+# These are the only unit spellings understood by the synthetic contract.
+# Aliases are explicit so an unknown unit cannot be guessed into equivalence.
+_UNIT_ALIASES = {
+    "mg": "mg",
+    "milligram": "mg",
+    "milligrams": "mg",
+    "synthetic-units": "synthetic-units",
+}
 
 
 def _normalize_dose(value: str) -> str:
@@ -84,7 +94,10 @@ def _normalize_dose(value: str) -> str:
                 f"dose exceeds clinical sanity upper bound of {MAX_DOSE_VALUE}"
             )
         normalized = dose.normalize()
-        return format(normalized, "f")
+        formatted = format(normalized, "f")
+        if len(formatted) > MAX_CANONICAL_DOSE_LENGTH:
+            raise ValueError("dose canonical form exceeds the representation bound")
+        return formatted
     except (ArithmeticError, InvalidOperation, ValueError, TypeError) as exc:
         raise ValueError("dose must be a valid, finite, positive decimal value") from exc
 
@@ -110,8 +123,17 @@ def canonicalize_action(action: ProtectedAction | Mapping[str, Any]) -> str:
         raise ValueError("duration must be null or a non-empty string")
     canonical = {field: values[field] for field in _PROTECTED_FIELDS}
     canonical["dose"] = _normalize_dose(canonical["dose"])
-    canonical["units"] = canonical["units"].lower()
-    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    unit_key = canonical["units"].strip().casefold()
+    if unit_key not in _UNIT_ALIASES:
+        raise ValueError("units must use a supported synthetic unit or alias")
+    canonical["units"] = _UNIT_ALIASES[unit_key]
+    return json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def action_hash(action: ProtectedAction | Mapping[str, Any]) -> str:

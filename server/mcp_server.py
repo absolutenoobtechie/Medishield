@@ -4,21 +4,99 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any, Optional
+import uuid
 
 from mcp.server.fastmcp import FastMCP
 
 from guard.gateway import verify_execution
 from guard.models import Decision, ExecutionRequest, ProtectedAction
 from guard.policy import PINNED_DESTINATIONS
+from privacy.auth import AuthorizationError, WorkspaceUser, authenticate_local, require_permission
 from server import backend
-from server.db import DEFAULT_DB_PATH, get_connection, init_db, initialize_db
+from server.db import DEFAULT_DB_PATH, get_connection, init_db
 
 
 DATABASE_PATH = DEFAULT_DB_PATH
 UPDATE_ORDER_TOOL = "update_order"
 
 mcp = FastMCP("MediShield")
+
+_TRUSTED_CONTEXT: ContextVar[WorkspaceUser | None] = ContextVar(
+    "medishield_trusted_mcp_context", default=None
+)
+
+
+@contextmanager
+def trusted_execution_context(
+    connection: sqlite3.Connection,
+    actor_id: str,
+    org_id: str,
+):
+    """Establish a server-resolved local-demo identity for one tool call.
+
+    This helper is intentionally not an MCP tool. A real transport adapter must
+    establish this context from its authenticated session. Without it, tools
+    that read protected records, read security events, create approvals, or
+    execute orders fail closed.
+    """
+
+    user = authenticate_local(connection, actor_id, org_id)
+    token = _TRUSTED_CONTEXT.set(user)
+    try:
+        yield user
+    finally:
+        _TRUSTED_CONTEXT.reset(token)
+
+
+def _trusted_user(connection: sqlite3.Connection, permission: str) -> WorkspaceUser:
+    user = _TRUSTED_CONTEXT.get()
+    if user is None:
+        raise AuthorizationError("an authenticated execution context is required")
+    return require_permission(connection, user, permission)
+
+
+def _context_actor() -> str:
+    user = _TRUSTED_CONTEXT.get()
+    return user.actor_id if user is not None else "system"
+
+
+def _audit_context_denial(
+    connection: sqlite3.Connection,
+    *,
+    request_id: str,
+    tool: str,
+    reason: str,
+) -> None:
+    """Persist a safe denial event or fail closed if the event cannot be saved."""
+
+    from guard.audit import record_audit_event
+
+    try:
+        record_audit_event(
+            {
+                "time": datetime.now(timezone.utc).isoformat(),
+                "request_id": request_id,
+                "actor": _context_actor(),
+                "tool": tool,
+                "action_type": tool,
+                "approval_id": None,
+                "decision": "blocked",
+                "risk": "high",
+                "rule": "authenticated context required",
+                "reason": reason,
+                "changed_fields": [],
+                "state_changed": False,
+            },
+            connection=connection,
+        )
+        connection.commit()
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        connection.rollback()
+        raise PermissionError("Access denied: the security event could not be recorded.") from None
 
 
 def _model_dump(model: Any) -> dict[str, Any]:
@@ -47,33 +125,179 @@ def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def get_tool_integrity_status() -> dict[str, Any]:
+    """Return the read-only Trust Sentinel result for testing and demos."""
+
+    from guard.sentinel import check_registry
+
+    return check_registry().to_dict()
+
+
+def tamper_runtime_registry(
+    tool_name: str = "unexpected_tool",
+    description: str = "Synthetic unexpected tool.",
+) -> dict[str, Any]:
+    """Inject a temporary synthetic tool into the FastMCP server to demonstrate drift."""
+
+    from guard.sentinel import check_registry
+
+    def _unexpected_tool_impl() -> str:
+        return "synthetic"
+
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is not None and hasattr(manager, "add_tool"):
+        try:
+            manager.add_tool(
+                _unexpected_tool_impl,
+                name=tool_name,
+                description=description,
+            )
+        except Exception:
+            pass
+    return check_registry().to_dict()
+
+
+def restore_runtime_registry() -> dict[str, Any]:
+    """Restore the FastMCP runtime registry to the canonical expected tools."""
+
+    from guard.sentinel import EXPECTED_TOOL_REGISTRY, check_registry
+
+    expected_names = {item["name"] for item in EXPECTED_TOOL_REGISTRY}
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is not None and hasattr(manager, "_tools"):
+        for name in list(manager._tools.keys()):
+            if name not in expected_names:
+                if hasattr(manager, "remove_tool"):
+                    manager.remove_tool(name)
+                else:
+                    manager._tools.pop(name, None)
+    return check_registry().to_dict()
+
+
 @mcp.tool()
 def get_patient_record(patient_id: str) -> dict[str, Any]:
     """Return one synthetic patient and that patient's synthetic orders."""
 
-    connection = initialize_db(DATABASE_PATH)
+    from guard import sentinel
+    from guard.audit import record_audit_event
+
     try:
-        patient = connection.execute(
-            "SELECT patient_id, name_synthetic FROM patients WHERE patient_id = ?",
+        registry_result = sentinel.check_registry()
+    except Exception:
+        # Tool-registry inspection is a trust dependency. Contain only this
+        # dependency failure so no handler or database read is reached.
+        try:
+            record_audit_event(
+                {
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "request_id": "REQ-PATIENT-ACCESS",
+                    "actor": _context_actor(),
+                    "tool": "get_patient_record",
+                    "action_type": "get_patient_record",
+                    "approval_id": None,
+                    "decision": "blocked",
+                    "risk": "high",
+                    "rule": "tool registry unverifiable",
+                    "reason": "The trusted tool registry could not be verified safely.",
+                    "changed_fields": [],
+                    "state_changed": False,
+                },
+                db_path=DATABASE_PATH,
+            )
+        except (sqlite3.Error, OSError, TypeError, ValueError):
+            raise PermissionError(
+                "Access denied: the security event could not be recorded."
+            ) from None
+        raise PermissionError(
+            "Access denied: the trusted tool registry could not be verified."
+        ) from None
+    if not registry_result.protected_execution_allowed:
+        try:
+            rule = {
+                "drift": "tool registry drift",
+                "baseline_invalid": "tool registry baseline invalid",
+                "unverifiable": "tool registry unverifiable",
+            }.get(registry_result.status, "tool registry unverifiable")
+            record_audit_event(
+                {
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "request_id": "REQ-PATIENT-ACCESS",
+                    "actor": _context_actor(),
+                    "tool": "get_patient_record",
+                    "action_type": "get_patient_record",
+                    "approval_id": None,
+                    "decision": "blocked",
+                    "risk": "high",
+                    "rule": rule,
+                    "reason": sentinel.audit_reason(registry_result),
+                    "changed_fields": [],
+                    "state_changed": False,
+                },
+                db_path=DATABASE_PATH,
+            )
+        except (sqlite3.Error, OSError, TypeError, ValueError):
+            raise PermissionError(
+                "Access denied: the security event could not be recorded."
+            ) from None
+        raise PermissionError(f"Access denied: {registry_result.explanation}")
+
+    connection = get_connection(DATABASE_PATH)
+    try:
+        init_db(connection)
+        try:
+            user = _trusted_user(connection, "patient_read")
+        except AuthorizationError as exc:
+            _audit_context_denial(
+                connection,
+                request_id="REQ-PATIENT-AUTH",
+                tool="get_patient_record",
+                reason="The patient-record request did not carry a valid authenticated organization context.",
+            )
+            raise PermissionError("Access denied: patient-record authorization failed.") from exc
+
+        scope = connection.execute(
+            "SELECT org_id FROM patients WHERE patient_id = ?",
             (patient_id,),
         ).fetchone()
-        if patient is None:
-            raise ValueError(f"Unknown synthetic patient: {patient_id}")
+        if scope is None or scope["org_id"] != user.org_id:
+            _audit_context_denial(
+                connection,
+                request_id="REQ-PATIENT-SCOPE",
+                tool="get_patient_record",
+                reason="The patient record is outside the authenticated organization scope.",
+            )
+            raise PermissionError("Access denied: patient-record authorization failed.")
 
-        orders = connection.execute(
-            """
-            SELECT order_id, patient_id, medication_id, dose, units,
-                   route, frequency, duration
-            FROM orders
-            WHERE patient_id = ?
-            ORDER BY order_id
-            """,
-            (patient_id,),
-        ).fetchall()
-        return {
-            "patient": _row_dict(patient),
-            "orders": [_row_dict(order) for order in orders],
-        }
+        patient = backend.get_patient_record(
+            patient_id,
+            connection=connection,
+            trusted_user=user,
+        )
+        request_id = f"REQ-PATIENT-{uuid.uuid4().hex}"
+        record_audit_event(
+            {
+                "time": datetime.now(timezone.utc).isoformat(),
+                "request_id": request_id,
+                "actor": user.actor_id,
+                "tool": "get_patient_record",
+                "action_type": "get_patient_record",
+                "approval_id": None,
+                "decision": "allowed",
+                "risk": "medium",
+                "rule": "tenant patient-read permission",
+                "reason": "Authenticated organization member retrieved a synthetic patient record.",
+                "changed_fields": [],
+                "state_changed": False,
+            },
+            connection=connection,
+        )
+        connection.commit()
+        return patient
+    except PermissionError:
+        raise
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        connection.rollback()
+        raise PermissionError("Access denied: the patient record could not be retrieved safely.") from None
     finally:
         connection.close()
 
@@ -92,14 +316,45 @@ def request_clinician_approval(
     approver_id: str,
     ttl_minutes: float,
 ) -> dict[str, Any]:
-    """Create a clinician approval for the exact validated protected action."""
+    """Create an approval only from a server-authenticated clinician context."""
 
     validated_action = _action(action)
-    approval_id = backend.create_approval(
-        validated_action,
-        approver_id,
-        ttl_minutes,
-    )
+    connection = get_connection(DATABASE_PATH)
+    try:
+        init_db(connection)
+        try:
+            user = _trusted_user(connection, "approval_confirm")
+        except AuthorizationError as exc:
+            _audit_context_denial(
+                connection,
+                request_id="REQ-APPROVAL-AUTH",
+                tool="request_clinician_approval",
+                reason="Approval creation requires a server-authenticated clinician context.",
+            )
+            raise PermissionError("Approval denied: clinician confirmation is required.") from exc
+        if approver_id != user.actor_id:
+            _audit_context_denial(
+                connection,
+                request_id="REQ-APPROVAL-IDENTITY",
+                tool="request_clinician_approval",
+                reason="The requested approver does not match the authenticated clinician context.",
+            )
+            raise PermissionError("Approval denied: approver identity did not match the authenticated context.")
+        approval_id = backend.create_approval(
+            validated_action,
+            user.actor_id,
+            ttl_minutes,
+            connection=connection,
+            trusted_user=user,
+        )
+        connection.commit()
+    except PermissionError:
+        raise
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
     return {
         "approval_id": approval_id,
         "approver_id": approver_id,
@@ -122,6 +377,29 @@ def execute_approved_order(
     """
 
     validated_action = _action(action)
+    context_connection = get_connection(DATABASE_PATH)
+    try:
+        init_db(context_connection)
+        try:
+            user = _trusted_user(context_connection, "clinical_execute")
+        except AuthorizationError as exc:
+            _audit_context_denial(
+                context_connection,
+                request_id=request_id,
+                tool=UPDATE_ORDER_TOOL,
+                reason="Protected execution requires a server-authenticated actor context.",
+            )
+            raise PermissionError("Execution denied: authenticated actor context is required.") from exc
+        if actor_id != user.actor_id:
+            _audit_context_denial(
+                context_connection,
+                request_id=request_id,
+                tool=UPDATE_ORDER_TOOL,
+                reason="The requested actor does not match the authenticated execution context.",
+            )
+            raise PermissionError("Execution denied: actor identity did not match the authenticated context.")
+    finally:
+        context_connection.close()
     actual_destination = destination if destination is not None else PINNED_DESTINATIONS[UPDATE_ORDER_TOOL]
     request = ExecutionRequest(
         request_id=request_id,
@@ -140,7 +418,7 @@ def execute_approved_order(
 
 @mcp.tool()
 def get_security_events(limit: int = 20) -> list[dict[str, Any]]:
-    """Return the newest synthetic security audit events."""
+    """Return security events visible to the authenticated audit role."""
 
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("limit must be a positive integer")
@@ -148,16 +426,32 @@ def get_security_events(limit: int = 20) -> list[dict[str, Any]]:
     connection = get_connection(DATABASE_PATH)
     try:
         init_db(connection)
+        try:
+            user = _trusted_user(connection, "security_events")
+        except AuthorizationError as exc:
+            _audit_context_denial(
+                connection,
+                request_id="REQ-SECURITY-EVENTS-AUTH",
+                tool="get_security_events",
+                reason="Security-event access requires an authorized audit or administrative role.",
+            )
+            raise PermissionError("Access denied: security-event authorization failed.") from exc
         rows = connection.execute(
             """
-            SELECT id, time, request_id, actor_id, tool, action_type,
-                   approval_id, decision, risk, rule, reason,
-                   changed_fields, state_changed
+            SELECT audit_events.id, audit_events.time, audit_events.request_id,
+                   audit_events.actor_id, audit_events.tool, audit_events.action_type,
+                   audit_events.approval_id, audit_events.decision, audit_events.risk,
+                   audit_events.rule, audit_events.reason,
+                   audit_events.changed_fields, audit_events.state_changed
             FROM audit_events
+            LEFT JOIN memberships ON memberships.actor_id = audit_events.actor_id
+                AND memberships.org_id = ? AND memberships.active = 1
+            WHERE audit_events.actor_id = 'system'
+               OR memberships.actor_id IS NOT NULL
             ORDER BY id DESC
             LIMIT ?
             """,
-            (limit,),
+            (user.org_id, limit),
         ).fetchall()
         events = []
         for row in rows:
@@ -170,6 +464,187 @@ def get_security_events(limit: int = 20) -> list[dict[str, Any]]:
         return events
     finally:
         connection.close()
+
+
+from guard.sentinel import RegistryVerificationResult, get_trusted_baseline_tools, verify_registry
+
+_active_registry: list[dict[str, Any]] = get_trusted_baseline_tools()
+
+
+def get_active_registry() -> list[dict[str, Any]]:
+    return [dict(t) for t in _active_registry]
+
+
+def set_active_registry(tools: list[dict[str, Any]]) -> None:
+    global _active_registry
+    _active_registry = [dict(t) for t in tools]
+
+
+def reset_active_registry_to_baseline() -> None:
+    global _active_registry
+    _active_registry = get_trusted_baseline_tools()
+
+
+def dispatch_mcp_tool_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    actor_id: str = "agent_1",
+    request_id: Optional[str] = None,
+    registry_override: Optional[list[dict[str, Any]]] = None,
+    connection: Optional[sqlite3.Connection] = None,
+) -> dict[str, Any]:
+    from guard.audit import record_audit_event
+
+    ts = datetime.now(timezone.utc).isoformat()
+    req_id = request_id or f"REQ-MCP-{int(datetime.now().timestamp() * 1000)}"
+
+    target_registry = registry_override if registry_override is not None else _active_registry
+    sentinel_result: RegistryVerificationResult = verify_registry(target_registry)
+
+    close_after = False
+    if connection is None:
+        connection = get_connection(DATABASE_PATH)
+        close_after = True
+
+    try:
+        if sentinel_result.status != "TRUSTED":
+            record_audit_event(
+                {
+                    "time": ts,
+                    "request_id": req_id,
+                    "actor": actor_id,
+                    "tool": tool_name,
+                    "action_type": f"mcp:{tool_name}",
+                    "approval_id": None,
+                    "decision": "blocked",
+                    "risk": "high",
+                    "rule": "registry drift detected",
+                    "reason": f"MCP Trust Sentinel detected tool registry drift: {sentinel_result.reason}",
+                    "changed_fields": sentinel_result.differences,
+                    "state_changed": False,
+                },
+                connection=connection,
+            )
+            if close_after:
+                connection.commit()
+
+            return {
+                "success": False,
+                "request_id": req_id,
+                "tool": tool_name,
+                "decision": "blocked",
+                "rule": "registry drift detected",
+                "reason": f"Execution halted fail-closed by MediShield Sentinel: {sentinel_result.reason}",
+                "sentinel_status": sentinel_result.status,
+                "expected_fingerprint": sentinel_result.expected_fingerprint,
+                "observed_fingerprint": sentinel_result.observed_fingerprint,
+                "fingerprints_match": sentinel_result.fingerprints_match,
+                "differences": sentinel_result.differences,
+                "handler_invoked": False,
+                "patient_record_returned": None,
+                "data": None,
+                "state_changed": False,
+                "timestamp": ts,
+            }
+
+        if tool_name == "get_patient_record":
+            patient_id = arguments.get("patient_id")
+            if not isinstance(patient_id, str) or not patient_id:
+                raise PermissionError("patient-record access requires a valid patient identifier")
+            try:
+                with trusted_execution_context(connection, actor_id, "ORG-DEMO"):
+                    patient_response = get_patient_record(patient_id)
+            except (AuthorizationError, PermissionError):
+                if close_after:
+                    connection.commit()
+                return {
+                    "success": False,
+                    "request_id": req_id,
+                    "tool": tool_name,
+                    "decision": "blocked",
+                    "rule": "patient access denied",
+                    "reason": "Authenticated organization permission was required for patient-record access.",
+                    "sentinel_status": "TRUSTED",
+                    "expected_fingerprint": sentinel_result.expected_fingerprint,
+                    "observed_fingerprint": sentinel_result.observed_fingerprint,
+                    "fingerprints_match": True,
+                    "differences": [],
+                    "handler_invoked": False,
+                    "patient_record_returned": None,
+                    "data": None,
+                    "state_changed": False,
+                    "timestamp": ts,
+                }
+            patient_record = patient_response["patient"]
+
+            return {
+                "success": True,
+                "request_id": req_id,
+                "tool": tool_name,
+                "decision": "allowed",
+                "rule": "registry verified",
+                "reason": "MCP tool registry verified. Authorized patient record retrieved.",
+                "sentinel_status": "TRUSTED",
+                "expected_fingerprint": sentinel_result.expected_fingerprint,
+                "observed_fingerprint": sentinel_result.observed_fingerprint,
+                "fingerprints_match": True,
+                "differences": [],
+                "handler_invoked": True,
+                "patient_record_returned": patient_response,
+                "data": patient_record,
+                "state_changed": False,
+                "timestamp": ts,
+            }
+        elif tool_name == "get_security_events":
+            try:
+                with trusted_execution_context(connection, actor_id, "ORG-DEMO"):
+                    events = get_security_events()
+            except (AuthorizationError, PermissionError):
+                if close_after:
+                    connection.commit()
+                return {
+                    "success": False,
+                    "request_id": req_id,
+                    "tool": tool_name,
+                    "decision": "blocked",
+                    "rule": "security-event access denied",
+                    "reason": "An authenticated audit role was required for security-event access.",
+                    "sentinel_status": "TRUSTED",
+                    "handler_invoked": False,
+                    "data": None,
+                    "state_changed": False,
+                    "timestamp": ts,
+                }
+            return {
+                "success": True,
+                "request_id": req_id,
+                "tool": tool_name,
+                "decision": "allowed",
+                "rule": "registry verified",
+                "reason": "Security events retrieved successfully.",
+                "sentinel_status": "TRUSTED",
+                "handler_invoked": True,
+                "data": events,
+                "state_changed": False,
+                "timestamp": ts,
+            }
+        else:
+            return {
+                "success": False,
+                "request_id": req_id,
+                "tool": tool_name,
+                "decision": "blocked",
+                "rule": "unsupported dispatch path",
+                "reason": "This dispatcher does not authorize unreviewed tool execution.",
+                "sentinel_status": "TRUSTED",
+                "handler_invoked": False,
+                "data": None,
+                "state_changed": False,
+                "timestamp": ts,
+            }
+    finally:
+        if close_after:
+            connection.close()
 
 
 if __name__ == "__main__":

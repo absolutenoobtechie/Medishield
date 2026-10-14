@@ -8,12 +8,18 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from server.backend import execute
+from server.backend import _GATEWAY_EXECUTION_TOKEN, execute
 from server.db import DEFAULT_DB_PATH, get_connection
 
 from .audit import record_audit_event
+from .approval import (
+    ApprovalAuthenticationError,
+    compute_approval_mac,
+    parse_approval_action,
+)
 from .intent import action_hash, canonicalize_action
 from .models import Decision, ExecutionRequest, ProtectedAction
+from . import sentinel
 from .policy import (
     PINNED_DESTINATIONS,
     TOOL_BASELINE_FINGERPRINTS,
@@ -85,8 +91,26 @@ def _blocked(rule: str, reason: str, changed_fields: list[str] | None = None) ->
     return _decision("blocked", rule, reason, changed_fields)
 
 
+def _registry_block(result: sentinel.TrustResult) -> Decision:
+    """Convert a non-trusted registry result into an auditable block."""
+
+    rule = {
+        "drift": "tool registry drift",
+        "baseline_invalid": "tool registry baseline invalid",
+        "unverifiable": "tool registry unverifiable",
+    }.get(result.status, "tool registry unverifiable")
+    return _blocked(rule, sentinel.audit_reason(result))
+
+
 def _risk_for(rule: str) -> str:
-    if rule in {"intent hash mismatch", "destination not pinned", "tool description not pinned"}:
+    if rule in {
+        "intent hash mismatch",
+        "destination not pinned",
+        "tool description not pinned",
+        "tool registry drift",
+        "tool registry baseline invalid",
+        "tool registry unverifiable",
+    }:
         return "high"
     return "medium"
 
@@ -121,13 +145,18 @@ def _audit(connection: sqlite3.Connection, request: Any, decision: Decision) -> 
 
 
 def _record_fail_closed(
-    connection: sqlite3.Connection, request: Any, decision: Decision
+    connection: sqlite3.Connection,
+    request: Any,
+    decision: Decision,
+    *,
+    commit: bool,
 ) -> Decision:
     """Persist a blocked result when the normal verification transaction failed."""
 
     try:
         _audit(connection, request, decision)
-        connection.commit()
+        if commit:
+            connection.commit()
     except (sqlite3.Error, OSError):
         try:
             connection.rollback()
@@ -141,6 +170,55 @@ def _parse_expiry(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("approval expiry must include a timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def _verify_approval_authentication(
+    approval: sqlite3.Row,
+    *,
+    tool: str,
+    destination: str,
+) -> Decision | None:
+    """Verify persisted action integrity and the gateway-only approval MAC."""
+
+    try:
+        parse_approval_action(approval["action_json"])
+        stored_hash = approval["action_hash"]
+        if not isinstance(stored_hash, str) or not hmac.compare_digest(
+            stored_hash, action_hash(json.loads(approval["action_json"]))
+        ):
+            return _blocked(
+                "approval invalid",
+                "The stored approval action fingerprint is invalid.",
+            )
+        expected_mac = compute_approval_mac(
+            approval_id=approval["approval_id"],
+            action_json=approval["action_json"],
+            action_hash=stored_hash,
+            approver_id=approval["approver_id"],
+            created_at=approval["created_at"],
+            expires_at=approval["expires_at"],
+            tool=tool,
+            destination=destination,
+        )
+        supplied_mac = approval["approval_mac"]
+        if not isinstance(supplied_mac, str) or not hmac.compare_digest(
+            supplied_mac, expected_mac
+        ):
+            return _blocked(
+                "approval authentication failed",
+                "The approval authentication data does not match the trusted record.",
+            )
+    except ApprovalAuthenticationError:
+        return _blocked(
+            "approval authentication unavailable",
+            "Approval authentication is unavailable, so execution was denied.",
+        )
+    except (TypeError, ValueError, ArithmeticError, json.JSONDecodeError):
+        return _blocked(
+            "approval invalid",
+            "The stored approval data is malformed or not canonical.",
+        )
+    return None
 
 
 def _changed_fields(stored_action_json: str, action: ProtectedAction) -> list[str]:
@@ -218,6 +296,28 @@ def _verify_in_transaction(
             "This actor role is not permitted to execute the requested tool.",
         )
 
+    patient_scope = connection.execute(
+        "SELECT org_id FROM patients WHERE patient_id = ?",
+        (request.action.patient_id,),
+    ).fetchone()
+    if patient_scope is None or not patient_scope["org_id"]:
+        return _blocked(
+            "patient scope unavailable",
+            "The protected patient is not registered in an organization scope.",
+        )
+    actor_scope = connection.execute(
+        """
+        SELECT 1 FROM memberships
+        WHERE org_id = ? AND actor_id = ? AND role = ? AND active = 1
+        """,
+        (patient_scope["org_id"], request.actor_id, actor["role"]),
+    ).fetchone()
+    if actor_scope is None:
+        return _blocked(
+            "tenant scope not permitted",
+            "The executing actor is not an active member of the patient's organization.",
+        )
+
     effective_destination = destination if destination is not None else getattr(request, "destination", None)
     baseline_failure = _validate_tool_baseline(connection, request.tool, effective_destination)
     if baseline_failure is not None:
@@ -225,18 +325,27 @@ def _verify_in_transaction(
 
     approval = connection.execute(
         """
-        SELECT action_hash, action_json, approver_id, expires_at, revoked, consumed
+        SELECT approval_id, action_hash, action_json, approver_id,
+               created_at, expires_at, revoked, consumed, approval_mac
         FROM approvals WHERE approval_id = ?
         """,
         (request.approval_id,),
     ).fetchone()
     if approval is None:
         return _blocked("approval not found", "No approval exists for this request.")
+    authentication_failure = _verify_approval_authentication(
+        approval,
+        tool=request.tool,
+        destination=effective_destination,
+    )
+    if authentication_failure is not None:
+        return authentication_failure
     try:
+        created_at = _parse_expiry(approval["created_at"])
         expires_at = _parse_expiry(approval["expires_at"])
     except (AttributeError, TypeError, ValueError):
-        return _blocked("approval invalid", "The approval expiry is invalid.")
-    if expires_at <= datetime.now(timezone.utc):
+        return _blocked("approval invalid", "The approval timestamps are invalid.")
+    if expires_at <= created_at or expires_at <= datetime.now(timezone.utc):
         return _blocked("approval expired", "The approval is outside its validity window.")
     if approval["revoked"]:
         return _blocked("approval revoked", "The clinician approval has been revoked.")
@@ -248,6 +357,18 @@ def _verify_in_transaction(
     ).fetchone()
     if approver is None or approver["role"] != "clinician":
         return _blocked("approval invalid", "The approval was not issued by a clinician.")
+    approver_scope = connection.execute(
+        """
+        SELECT 1 FROM memberships
+        WHERE org_id = ? AND actor_id = ? AND role = 'clinician' AND active = 1
+        """,
+        (patient_scope["org_id"], approval["approver_id"]),
+    ).fetchone()
+    if approver_scope is None:
+        return _blocked(
+            "approval tenant mismatch",
+            "The clinician approval is not scoped to the patient's organization.",
+        )
 
     try:
         submitted_hash = action_hash(request.action)
@@ -270,7 +391,11 @@ def _verify_in_transaction(
     if consumed != 1:
         return _blocked("approval already consumed", "The one-time approval was already used.")
 
-    execute(_canonical_request(request), connection)
+    execute(
+        _canonical_request(request),
+        connection,
+        _gateway_token=_GATEWAY_EXECUTION_TOKEN,
+    )
     return _decision(
         "allowed",
         "intent hash matched",
@@ -288,6 +413,9 @@ def verify_execution(
 
     close_after = connection is None
     connection = connection if connection is not None else get_connection(DEFAULT_DB_PATH)
+    caller_transaction = connection.in_transaction
+    savepoint_name = "medishield_gateway"
+    savepoint_active = False
     try:
         try:
             validated_request = _validate_request(request)
@@ -296,16 +424,54 @@ def verify_execution(
                 connection,
                 request,
                 _blocked("malformed request", "The execution request is invalid."),
+                commit=close_after or not caller_transaction,
             )
 
-        connection.execute("BEGIN IMMEDIATE")
+        try:
+            registry_result = sentinel.check_registry()
+        except Exception:
+            # Registry inspection is a trust dependency.  Contain failures at
+            # this boundary so an SDK or inspection error cannot become an
+            # execution success or expose an internal traceback to callers.
+            return _record_fail_closed(
+                connection,
+                validated_request,
+                _blocked(
+                    "tool registry unverifiable",
+                    "The trusted tool registry could not be verified safely.",
+                ),
+                commit=close_after or not caller_transaction,
+            )
+        if not registry_result.protected_execution_allowed:
+            return _record_fail_closed(
+                connection,
+                validated_request,
+                _registry_block(registry_result),
+                commit=close_after or not caller_transaction,
+            )
+
+        if caller_transaction:
+            # Do not commit a transaction that belongs to the caller. The
+            # savepoint still makes the approval/order/audit unit reversible.
+            connection.execute(f"SAVEPOINT {savepoint_name}")
+            savepoint_active = True
+        else:
+            connection.execute("BEGIN IMMEDIATE")
         decision = _verify_in_transaction(connection, validated_request, destination)
         _audit(connection, validated_request, decision)
-        connection.commit()
+        if caller_transaction:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            savepoint_active = False
+        else:
+            connection.commit()
         return decision
     except (sqlite3.Error, TypeError, ValueError, ArithmeticError, OSError):
         try:
-            connection.rollback()
+            if savepoint_active:
+                connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                connection.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            elif not caller_transaction:
+                connection.rollback()
         except sqlite3.Error:
             pass
         return _record_fail_closed(
@@ -315,6 +481,7 @@ def verify_execution(
                 "verification failed",
                 "The request could not be verified safely and was not executed.",
             ),
+            commit=close_after or not caller_transaction,
         )
     finally:
         if close_after:

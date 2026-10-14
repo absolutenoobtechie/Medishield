@@ -114,55 +114,54 @@ def seed_data(connection: sqlite3.Connection) -> None:
             ("P-422", "Synthetic Patient Delta (Maria Garcia)"),
         ],
     )
-    connection.executemany(
-        """
-        INSERT OR IGNORE INTO orders(
-            order_id, patient_id, medication_id, dose, units, route, frequency, duration
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                "ORD-DEMO-001",
-                "P-104",
-                "MED-A",
-                "SIMULATED-5",
-                "synthetic-units",
-                "simulated-route",
-                "demo-only",
-                "demo-duration",
-            ),
-            (
-                "ORD-DEMO-002",
-                "P-205",
-                "MED-B",
-                "500",
-                "mg",
-                "oral",
-                "twice daily",
-                "14 days",
-            ),
-            (
-                "ORD-DEMO-003",
-                "P-318",
-                "MED-C",
-                "250",
-                "mg",
-                "oral",
-                "three times daily",
-                "10 days",
-            ),
-            (
-                "ORD-DEMO-004",
-                "P-422",
-                "MED-D",
-                "10",
-                "mg",
-                "subcutaneous",
-                "daily",
-                "30 days",
-            ),
-        ],
-    )
+    # Keep apply_order as the only order-table writer, including for demo data.
+    from guard.models import ProtectedAction
+    from .backend import apply_order
+
+    demo_orders = [
+        ProtectedAction(
+            patient_id="P-104",
+            medication_id="MED-A",
+            dose="SIMULATED-5",
+            units="synthetic-units",
+            route="simulated-route",
+            frequency="demo-only",
+            duration="demo-duration",
+            order_id="ORD-DEMO-001",
+        ),
+        ProtectedAction(
+            patient_id="P-205",
+            medication_id="MED-B",
+            dose="500",
+            units="mg",
+            route="oral",
+            frequency="twice daily",
+            duration="14 days",
+            order_id="ORD-DEMO-002",
+        ),
+        ProtectedAction(
+            patient_id="P-318",
+            medication_id="MED-C",
+            dose="250",
+            units="mg",
+            route="oral",
+            frequency="three times daily",
+            duration="10 days",
+            order_id="ORD-DEMO-003",
+        ),
+        ProtectedAction(
+            patient_id="P-422",
+            medication_id="MED-D",
+            dose="10",
+            units="mg",
+            route="subcutaneous",
+            frequency="daily",
+            duration="30 days",
+            order_id="ORD-DEMO-004",
+        ),
+    ]
+    for action in demo_orders:
+        apply_order(action, connection=connection)
     connection.commit()
 
 

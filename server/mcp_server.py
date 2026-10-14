@@ -181,7 +181,7 @@ def dispatch_mcp_tool_call(
                     "rule": "registry drift detected",
                     "reason": f"MCP Trust Sentinel detected tool registry drift: {sentinel_result.reason}",
                     "changed_fields": sentinel_result.differences,
-                    "state_changed": 0,
+                    "state_changed": False,
                 },
                 connection=connection,
             )
@@ -225,7 +225,7 @@ def dispatch_mcp_tool_call(
                     "rule": "registry verified",
                     "reason": "MCP tool registry verified against trusted baseline. Protected handler executed.",
                     "changed_fields": [],
-                    "state_changed": 0,
+                    "state_changed": False,
                 },
                 connection=connection,
             )

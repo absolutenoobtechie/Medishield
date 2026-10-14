@@ -7,7 +7,7 @@ for AI-connected clinical backend tools.
 Built strictly with Python and Streamlit.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -16,6 +16,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+
+# Indian Standard Time (IST) definition: UTC + 5:30
+IST_TZ = timezone(timedelta(hours=5, minutes=30), name="IST")
+
+
+def to_ist_string(time_val: Any) -> str:
+    """Convert an ISO UTC timestamp string to formatted Indian Standard Time (IST)."""
+    if not time_val:
+        return "N/A"
+    try:
+        s = str(time_val).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ist_dt = dt.astimezone(IST_TZ)
+        return ist_dt.strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return str(time_val)
 
 # ==============================================================================
 # SECTION 1: Path Setup & Module Imports
@@ -318,8 +338,9 @@ with tab_overview:
         display_df = recent_df[[
             "time", "request_id", "actor", "tool", "decision", "risk", "rule", "state_changed"
         ]].copy()
+        display_df["time"] = display_df["time"].apply(to_ist_string)
         display_df.columns = [
-            "Timestamp (UTC)", "Request ID", "Actor", "Tool", "Decision", "Risk", "Security Rule", "State Modified"
+            "Timestamp (IST)", "Request ID", "Actor", "Tool", "Decision", "Risk", "Security Rule", "State Modified"
         ]
 
         def style_decision(val):
@@ -891,8 +912,9 @@ with tab_audit:
         # Select and format columns for clean display
         show_cols = ["time", "request_id", "actor", "tool", "decision", "risk", "rule", "state_changed"]
         clean_df = audit_df[show_cols].copy()
+        clean_df["time"] = clean_df["time"].apply(to_ist_string)
         clean_df.columns = [
-            "Timestamp (UTC)", "Request ID", "Actor", "Tool", "Decision", "Risk", "Rule Triggered", "State Changed"
+            "Timestamp (IST)", "Request ID", "Actor", "Tool", "Decision", "Risk", "Rule Triggered", "State Changed"
         ]
 
         def style_audit_dec(val):
@@ -918,7 +940,7 @@ with tab_audit:
         # Clean Event Detail Panel
         st.subheader("Event Detail Inspection Panel")
         event_labels = [
-            f"#{i+1} | [{filtered_events[i].get('decision', '').upper()}] {filtered_events[i].get('request_id', '')} — {filtered_events[i].get('tool', '')} ({filtered_events[i].get('time', '')})"
+            f"#{i+1} | [{filtered_events[i].get('decision', '').upper()}] {filtered_events[i].get('request_id', '')} — {filtered_events[i].get('tool', '')} ({to_ist_string(filtered_events[i].get('time', ''))})"
             for i in range(len(filtered_events))
         ]
         sel_idx = st.selectbox(
@@ -962,11 +984,12 @@ with tab_audit:
                 st.success("`[]` *(No fields changed)*")
 
         # Section 3: Metadata Metrics
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Request ID", selected_event.get("request_id", "N/A"))
         m2.metric("Actor ID", selected_event.get("actor", "N/A"))
         m3.metric("Tool Name", selected_event.get("tool", "N/A"))
         m4.metric("Approval ID", str(selected_event.get("approval_id") or "None"))
+        m5.metric("Timestamp (IST)", to_ist_string(selected_event.get("time")))
 
         # Section 4: Raw JSON in collapsed expander
         with st.expander("📄 View Raw Audit Event (JSON)", expanded=False):

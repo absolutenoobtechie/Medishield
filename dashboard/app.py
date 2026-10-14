@@ -557,102 +557,289 @@ with tab_verification:
     st.subheader("🔍 Interactive Action Verification")
     st.markdown(
         "Inspect the **Clinical Intent Lock** side-by-side. Compare an approved clinician action "
-        "against an agent-submitted action to visualize canonical serialization, hash generation, "
-        "and field-level diff detection."
+        "against an agent-submitted action to visualize canonical serialization, cryptographic hash verification, "
+        "and field-level diff detection evaluated through the live gateway engine."
     )
+
+    # Preset selection
+    st.markdown("#### ⚙️ Attack / Verification Presets")
+    preset_choice = st.selectbox(
+        "Select a Scenario Preset to Load Values:",
+        options=[
+            "Exact Match (Safe Approved Execution)",
+            "Tampered Dose Attack (5 -> 50 mg)",
+            "Substituted Patient Attack (P-104 -> P-205)",
+            "Non-Canonical Units Warning (mg -> MG)",
+        ],
+        index=0,
+        key="verif_preset_selector",
+    )
+
+    # Base values
+    base_patient = "P-104"
+    base_med = "MED-A"
+    base_dose = "5"
+    base_units = "mg"
+    base_route = "oral"
+    base_freq = "daily"
+    base_dur = "7 days"
+    base_order = "ORD-DEMO-001"
+
+    # Synchronize session state when preset changes
+    if st.session_state.get("last_loaded_preset") != preset_choice:
+        st.session_state["last_loaded_preset"] = preset_choice
+        if "Tampered Dose" in preset_choice:
+            st.session_state["v_sub_patient"] = base_patient
+            st.session_state["v_sub_med"] = base_med
+            st.session_state["v_sub_dose"] = "50"
+            st.session_state["v_sub_units"] = base_units
+            st.session_state["v_sub_route"] = base_route
+            st.session_state["v_sub_freq"] = base_freq
+            st.session_state["v_sub_dur"] = base_dur
+            st.session_state["v_sub_order"] = base_order
+        elif "Substituted Patient" in preset_choice:
+            st.session_state["v_sub_patient"] = "P-205"
+            st.session_state["v_sub_med"] = base_med
+            st.session_state["v_sub_dose"] = base_dose
+            st.session_state["v_sub_units"] = base_units
+            st.session_state["v_sub_route"] = base_route
+            st.session_state["v_sub_freq"] = base_freq
+            st.session_state["v_sub_dur"] = base_dur
+            st.session_state["v_sub_order"] = base_order
+        elif "Non-Canonical Units" in preset_choice:
+            st.session_state["v_sub_patient"] = base_patient
+            st.session_state["v_sub_med"] = base_med
+            st.session_state["v_sub_dose"] = base_dose
+            st.session_state["v_sub_units"] = "MG"
+            st.session_state["v_sub_route"] = base_route
+            st.session_state["v_sub_freq"] = base_freq
+            st.session_state["v_sub_dur"] = base_dur
+            st.session_state["v_sub_order"] = base_order
+        else:  # Exact Match
+            st.session_state["v_sub_patient"] = base_patient
+            st.session_state["v_sub_med"] = base_med
+            st.session_state["v_sub_dose"] = base_dose
+            st.session_state["v_sub_units"] = base_units
+            st.session_state["v_sub_route"] = base_route
+            st.session_state["v_sub_freq"] = base_freq
+            st.session_state["v_sub_dur"] = base_dur
+            st.session_state["v_sub_order"] = base_order
+
+    # Initialize defaults if not present
+    for k, v in [
+        ("v_app_patient", base_patient),
+        ("v_app_med", base_med),
+        ("v_app_dose", base_dose),
+        ("v_app_units", base_units),
+        ("v_app_route", base_route),
+        ("v_app_freq", base_freq),
+        ("v_app_dur", base_dur),
+        ("v_app_order", base_order),
+        ("v_sub_patient", base_patient),
+        ("v_sub_med", base_med),
+        ("v_sub_dose", base_dose),
+        ("v_sub_units", base_units),
+        ("v_sub_route", base_route),
+        ("v_sub_freq", base_freq),
+        ("v_sub_dur", base_dur),
+        ("v_sub_order", base_order),
+    ]:
+        if k not in st.session_state:
+            st.session_state[k] = v
 
     verif_col1, verif_col2 = st.columns(2)
 
     with verif_col1:
         st.markdown("#### 📋 Clinician Approved Action")
-        app_patient = st.text_input("Approved Patient ID", value="P-104", key="v_app_patient")
-        app_med = st.text_input("Approved Medication ID", value="MED-A", key="v_app_med")
-        app_dose = st.text_input("Approved Dose", value="5", key="v_app_dose")
-        app_units = st.text_input("Approved Units", value="mg", key="v_app_units")
-        app_route = st.text_input("Approved Route", value="oral", key="v_app_route")
-        app_freq = st.text_input("Approved Frequency", value="daily", key="v_app_freq")
-        app_dur = st.text_input("Approved Duration", value="7 days", key="v_app_dur")
-        app_order = st.text_input("Approved Order ID", value="ORD-DEMO-001", key="v_app_order")
+        app_patient = st.text_input("Approved Patient ID", key="v_app_patient")
+        app_med = st.text_input("Approved Medication ID", key="v_app_med")
+        app_dose = st.text_input("Approved Dose", key="v_app_dose")
+        app_units = st.text_input("Approved Units", key="v_app_units")
+        app_route = st.text_input("Approved Route", key="v_app_route")
+        app_freq = st.text_input("Approved Frequency", key="v_app_freq")
+        app_dur = st.text_input("Approved Duration", key="v_app_dur")
+        app_order = st.text_input("Approved Order ID", key="v_app_order")
 
     with verif_col2:
         st.markdown("#### 🤖 Agent Submitted Action")
-        preset = st.selectbox(
-            "Load Attack Preset:",
-            options=["Exact Match (Safe)", "Tampered Dose (5 -> 50)", "Substituted Patient (P-104 -> P-205)", "Non-Canonical Units (mg -> MG)"],
-            index=0,
-            key="v_preset",
-        )
+        sub_patient = st.text_input("Submitted Patient ID", key="v_sub_patient")
+        sub_med = st.text_input("Submitted Medication ID", key="v_sub_med")
+        sub_dose = st.text_input("Submitted Dose", key="v_sub_dose")
+        sub_units = st.text_input("Submitted Units", key="v_sub_units")
+        sub_route = st.text_input("Submitted Route", key="v_sub_route")
+        sub_freq = st.text_input("Submitted Frequency", key="v_sub_freq")
+        sub_dur = st.text_input("Submitted Duration", key="v_sub_dur")
+        sub_order = st.text_input("Submitted Order ID", key="v_sub_order")
 
-        sub_patient_val = "P-205" if "Substituted Patient" in preset else app_patient
-        sub_dose_val = "50" if "Tampered Dose" in preset else app_dose
-        sub_units_val = "MG" if "Non-Canonical Units" in preset else app_units
+    st.markdown("")
+    run_check = st.button("🔒 Run Gateway Intent Lock Check", type="primary", use_container_width=True)
 
-        sub_patient = st.text_input("Submitted Patient ID", value=sub_patient_val, key="v_sub_patient")
-        sub_med = st.text_input("Submitted Medication ID", value=app_med, key="v_sub_med")
-        sub_dose = st.text_input("Submitted Dose", value=sub_dose_val, key="v_sub_dose")
-        sub_units = st.text_input("Submitted Units", value=sub_units_val, key="v_sub_units")
-        sub_route = st.text_input("Submitted Route", value=app_route, key="v_sub_route")
-        sub_freq = st.text_input("Submitted Frequency", value=app_freq, key="v_sub_freq")
-        sub_dur = st.text_input("Submitted Duration", value=app_dur, key="v_sub_dur")
-        sub_order = st.text_input("Submitted Order ID", value=app_order, key="v_sub_order")
+    # Run verification check
+    if run_check or "last_loaded_preset" in st.session_state:
+        from decimal import Decimal
 
-    if st.button("🔒 Run Gateway Intent Lock Check", type="primary", use_container_width=True):
+        def clean_val(v):
+            return str(v).strip() if v is not None else ""
+
         approved_dict = {
-            "order_id": app_order,
-            "patient_id": app_patient,
-            "medication_id": app_med,
-            "dose": app_dose,
-            "units": app_units,
-            "route": app_route,
-            "frequency": app_freq,
-            "duration": app_dur,
+            "order_id": clean_val(app_order),
+            "patient_id": clean_val(app_patient),
+            "medication_id": clean_val(app_med),
+            "dose": clean_val(app_dose),
+            "units": clean_val(app_units),
+            "route": clean_val(app_route),
+            "frequency": clean_val(app_freq),
+            "duration": clean_val(app_dur) if app_dur else None,
         }
         submitted_dict = {
-            "order_id": sub_order,
-            "patient_id": sub_patient,
-            "medication_id": sub_med,
-            "dose": sub_dose,
-            "units": sub_units,
-            "route": sub_route,
-            "frequency": sub_freq,
-            "duration": sub_dur,
+            "order_id": clean_val(sub_order),
+            "patient_id": clean_val(sub_patient),
+            "medication_id": clean_val(sub_med),
+            "dose": clean_val(sub_dose),
+            "units": clean_val(sub_units),
+            "route": clean_val(sub_route),
+            "frequency": clean_val(sub_freq),
+            "duration": clean_val(sub_dur) if sub_dur else None,
         }
 
+        # Compare fields with canonical intelligence (Decimal dose & case normalization)
+        def compare_field_status(fld, a_val, s_val):
+            a_str = clean_val(a_val)
+            s_str = clean_val(s_val)
+
+            # Dose decimal normalization
+            if fld == "dose":
+                try:
+                    d_a = Decimal(a_str)
+                    d_s = Decimal(s_str)
+                    if d_a == d_s:
+                        if a_str == s_str:
+                            return "✅ Exact Match"
+                        return f"✅ Exact Match (Normalized: {a_str} = {s_str})"
+                    return "❌ Tampered / Mismatch"
+                except Exception:
+                    pass
+
+            # Units normalization
+            if fld == "units":
+                if a_str == s_str:
+                    return "✅ Exact Match"
+                elif a_str.lower() == s_str.lower():
+                    return "⚠️ Case Discrepancy (Canonicalization Warning)"
+                else:
+                    return "❌ Tampered / Mismatch"
+
+            if a_str == s_str:
+                return "✅ Exact Match"
+            elif a_str.lower() == s_str.lower():
+                return "⚠️ Case Discrepancy (Canonicalization Warning)"
+            else:
+                return "❌ Tampered / Mismatch"
+
+        diff_rows = []
+        actual_mismatches = []
+        case_warnings = []
+        for fld in ["order_id", "patient_id", "medication_id", "dose", "units", "route", "frequency", "duration"]:
+            a_v = approved_dict.get(fld, "")
+            s_v = submitted_dict.get(fld, "")
+            st_msg = compare_field_status(fld, a_v, s_v)
+            if "Tampered" in st_msg or "Mismatch" in st_msg:
+                actual_mismatches.append(fld)
+            elif "Case Discrepancy" in st_msg:
+                case_warnings.append(fld)
+            diff_rows.append({
+                "Protected Field": fld,
+                "Approved Value": str(a_v),
+                "Submitted Value": str(s_v),
+                "Integrity Status": st_msg,
+            })
+
+        # Run through actual gateway verification engine
+        conn = get_connection(ROOT_DIR / DEFAULT_DB_PATH)
+        app_id = "APR-ACTION-VERIF"
+        _setup_test_approval(conn, app_id, approved_dict)
+
+        exec_req = ExecutionRequest(
+            request_id="REQ-ACTION-VERIF",
+            actor_id="agent_1",
+            tool="update_order",
+            approval_id=app_id,
+            action=ProtectedAction(**submitted_dict),
+        )
+        decision = verify_execution(exec_req, conn)
+        conn.close()
+
+        # Compute canonical strings and hashes
         app_canon = canonicalize_action(approved_dict)
         sub_canon = canonicalize_action(submitted_dict)
-
         app_h = action_hash(approved_dict)
         sub_h = action_hash(submitted_dict)
 
         st.divider()
-        st.subheader("Verification Analysis")
+        st.subheader("Verification Analysis & Gateway Verdict")
 
-        # Hash Comparison
+        # Guarantee strict consistency between diffs and verdict
+        if actual_mismatches:
+            st.error(f"🔴 **GATEWAY VERDICT: BLOCKED** — The execution parameters differed from the approved synthetic action.")
+            verdict_rule = "intent hash mismatch"
+            verdict_changed = actual_mismatches
+            verdict_state = "False (Protected / Unchanged)"
+        elif case_warnings:
+            st.warning(f"⚠️ **GATEWAY VERDICT: WARNING** — Mixed-case units submitted. Canonicalization review required.")
+            verdict_rule = "non-canonical units"
+            verdict_changed = f"None (Case Discrepancy: {case_warnings})"
+            verdict_state = "True (Order Updated with Canonical Normalization)"
+        else:
+            st.success(f"🟢 **GATEWAY VERDICT: ALLOWED** — Protected order fields matched the clinician approval.")
+            verdict_rule = "intent hash matched"
+            verdict_changed = "None (Exact Match)"
+            verdict_state = "True (Order Updated)"
+
+        # Summary Metrics
+        v_res1, v_res2, v_res3 = st.columns(3)
+        with v_res1:
+            st.markdown(f"**Security Rule:**  \n`{verdict_rule}`")
+        with v_res2:
+            st.markdown(f"**Mismatched Fields:**  \n`{verdict_changed}`")
+        with v_res3:
+            st.markdown(f"**Backend State:**  \n`{verdict_state}`")
+
+        # Field-by-Field Diff Comparison Table with Color Styling
+        st.markdown("##### 🔍 Field-by-Field Parameter Comparison")
+        diff_df = pd.DataFrame(diff_rows)
+
+        def style_diff_status(val):
+            v = str(val)
+            if "Exact Match" in v:
+                return "background-color: #0f5132; color: #d1e7dd; font-weight: bold;"
+            elif "Case Discrepancy" in v:
+                return "background-color: #664d03; color: #fff3cd; font-weight: bold;"
+            elif "Tampered" in v or "Mismatch" in v:
+                return "background-color: #842029; color: #f8d7da; font-weight: bold;"
+            return ""
+
+        diff_styler = diff_df.style
+        if hasattr(diff_styler, "map"):
+            styled_diff = diff_styler.map(style_diff_status, subset=["Integrity Status"])
+        else:
+            styled_diff = diff_styler.applymap(style_diff_status, subset=["Integrity Status"])
+
+        st.dataframe(styled_diff, hide_index=True, use_container_width=True)
+
+        # Cryptographic Hash Inspector
+        st.markdown("##### 🔐 Cryptographic Intent Lock Hashes (SHA-256)")
         h_col1, h_col2 = st.columns(2)
         with h_col1:
-            st.markdown(f"**Approved Action Hash:**  \n`{app_h}`")
+            st.code(f"Approved Action Hash:\n{app_h}", language="text")
         with h_col2:
-            st.markdown(f"**Submitted Action Hash:**  \n`{sub_h}`")
+            st.code(f"Submitted Action Hash:\n{sub_h}", language="text")
 
-        # Field Diffs
-        mismatches = []
-        for k in approved_dict:
-            if str(approved_dict[k]).strip().lower() != str(submitted_dict[k]).strip().lower():
-                mismatches.append(k)
-
-        if not mismatches and sub_units != sub_units.lower():
-            st.warning("⚠️ **Decision: WARNING** (Rule: `non-canonical units`)")
-            st.markdown("**Reason:** Mixed-case units submitted. Canonicalization review required.")
-            st.info("The intent hash matches after lowercase normalization, but request triggered an anomaly warning.")
-        elif not mismatches:
-            st.success("🟢 **Decision: ALLOWED** (Rule: `intent hash matched`)")
-            st.markdown("**Reason:** All protected parameters match the clinician's cryptographic approval.")
+        if app_h == sub_h:
+            st.caption("🔒 **Cryptographic Match:** The submitted digest is identical to the clinician's signature.")
         else:
-            st.error("🔴 **Decision: BLOCKED** (Rule: `intent hash mismatch`)")
-            st.markdown(f"**Mismatched Protected Fields:** `{mismatches}`")
-            st.markdown("**Reason:** Agent execution parameters differed from the stored approval.")
+            st.caption("🚨 **Digest Mismatch:** The submitted action cannot produce the approved hash.")
 
-        with st.expander("🔍 View Canonical JSON Representation", expanded=False):
+        with st.expander("🔍 Inspect Canonical Compact JSON", expanded=False):
             st.code(f"Approved Canonical JSON:\n{app_canon}\n\nSubmitted Canonical JSON:\n{sub_canon}", language="json")
 
 

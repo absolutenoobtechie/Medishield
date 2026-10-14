@@ -7,16 +7,17 @@ isolated and intentionally vulnerable for synthetic demonstration only.
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
 from typing import Any, Iterator
 from unittest.mock import patch
 
 from guard import audit
 from guard import gateway
+from guard import sentinel
 from guard.intent import action_hash, canonicalize_action
 from guard.models import ExecutionRequest, ProtectedAction
 from server import backend
@@ -391,10 +392,7 @@ def guard_off_vs_guard_on() -> dict[str, Any]:
 
             baseline_before = _backend_state(baseline_connection)
             # Intentionally bypass the gateway in the isolated vulnerable path.
-            backend.execute(
-                SimpleNamespace(action=tampered_action),
-                connection=baseline_connection,
-            )
+            backend.apply_order(tampered_action, connection=baseline_connection)
             baseline_connection.commit()
             baseline_after = _backend_state(baseline_connection)
 
@@ -430,3 +428,103 @@ def guard_off_vs_guard_on() -> dict[str, Any]:
                     "backend_state_after": protected_after,
                 },
             }
+
+
+def tool_registry_tampering() -> dict[str, Any]:
+    """Demonstrate declared-tool drift blocking a real gateway execution.
+
+    The altered registry is an in-memory fixture. No injected function is
+    executed, and the source trusted baseline is not changed.
+    """
+
+    with _temporary_database() as connection:
+        expected_fingerprint = sentinel.registry_fingerprint(
+            sentinel.EXPECTED_TOOL_REGISTRY
+        )
+        simulated_registry = list(copy.deepcopy(sentinel.EXPECTED_TOOL_REGISTRY))
+        simulated_registry.append(
+            {
+                "name": "unexpected_tool",
+                "title": None,
+                "description": "Synthetic unexpected tool.",
+                "inputSchema": {"type": "object"},
+                "outputSchema": {"additionalProperties": True, "type": "object"},
+                "annotations": None,
+                "icons": None,
+                "meta": None,
+            }
+        )
+        simulated_result = sentinel.check_registry(simulated_registry)
+
+        approved_action = _approved_action()
+        approval_id = "APR-TOOL-REGISTRY-TAMPER"
+        _create_approval(connection, approved_action, approval_id)
+        request = _request(approved_action, approval_id, "REQ-TOOL-REGISTRY-TAMPER")
+        state_before = _backend_state(connection)
+
+        # Instrument the protected execution handler with a spy counter.
+        execute_calls = 0
+        original_execute = backend.execute
+
+        def _spy_execute(*args, **kwargs):
+            nonlocal execute_calls
+            execute_calls += 1
+            return original_execute(*args, **kwargs)
+
+        # This patch changes only the isolated observed fixture for the demo;
+        # it does not replace the trusted baseline or add an execution bypass.
+        with patch.object(
+            sentinel, "inspect_runtime_registry", return_value=simulated_registry
+        ), patch.object(backend, "execute", side_effect=_spy_execute):
+            blocked = gateway.verify_execution(
+                request, connection, destination=_PINNED_DESTINATION
+            )
+            handler_invoked_on_block = execute_calls > 0
+
+        state_after_block = _backend_state(connection)
+        approval_after_block = connection.execute(
+            "SELECT consumed FROM approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()[0]
+
+        from guard.forensics import evidence_for_request
+
+        blocked_evidence = evidence_for_request(
+            "REQ-TOOL-REGISTRY-TAMPER", connection=connection
+        )
+
+        restored_result = sentinel.check_registry()
+        allowed = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
+        state_after_restore = _backend_state(connection)
+        approval_after_restore = connection.execute(
+            "SELECT consumed FROM approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()[0]
+
+        return {
+            "expected_fingerprint_before": expected_fingerprint,
+            "expected_fingerprint_after": sentinel.registry_fingerprint(
+                sentinel.EXPECTED_TOOL_REGISTRY
+            ),
+            "simulated_registry": simulated_result.to_dict(),
+            "blocked": {
+                "decision": blocked.decision,
+                "rule": blocked.rule,
+                "state_changed": blocked.state_changed,
+                "backend_state_before": state_before,
+                "backend_state_after": state_after_block,
+                "approval_consumed": bool(approval_after_block),
+                "handler_invoked": handler_invoked_on_block,
+                "handler_calls": execute_calls,
+                "evidence": blocked_evidence,
+            },
+            "restored": {
+                "registry": restored_result.to_dict(),
+                "decision": allowed.decision,
+                "state_changed": allowed.state_changed,
+                "backend_state_after": state_after_restore,
+                "approval_consumed": bool(approval_after_restore),
+            },
+        }

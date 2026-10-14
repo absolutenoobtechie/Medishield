@@ -1067,8 +1067,7 @@ with tab_verification:
     st.markdown("")
     run_check = st.button("🔒 Run Gateway Intent Lock Check", type="primary", use_container_width=True)
 
-    # Verification execution (safe in both bare import mode and active Streamlit session)
-    is_live_context = hasattr(st, "runtime") and st.runtime.exists()
+
 
     if is_live_context and (run_check or "last_loaded_preset" in st.session_state):
         def clean_val(v, default=""):

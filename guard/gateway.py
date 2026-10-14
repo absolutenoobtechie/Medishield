@@ -142,7 +142,7 @@ def _changed_fields(stored_action_json: str, action: ProtectedAction) -> list[st
     try:
         approved = json.loads(canonicalize_action(json.loads(stored_action_json)))
         submitted = json.loads(canonicalize_action(action))
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, ArithmeticError, json.JSONDecodeError):
         return list(_model_fields(ProtectedAction))
     return [field for field in _model_fields(ProtectedAction) if approved[field] != submitted[field]]
 
@@ -155,7 +155,7 @@ def _validate_tool_baseline(
     trusted = _TRUSTED_TOOL_BASELINES.get(tool)
     if trusted is None:
         return _blocked("tool not pinned", "The requested tool is not a pinned tool.")
-    if destination is not None and not hmac.compare_digest(destination, trusted["destination"]):
+    if not destination or not hmac.compare_digest(destination, trusted["destination"]):
         return _blocked(
             "destination not pinned",
             "The requested destination differs from the trusted baseline.",
@@ -209,7 +209,8 @@ def _verify_in_transaction(
             "This actor role is not permitted to execute the requested tool.",
         )
 
-    baseline_failure = _validate_tool_baseline(connection, request.tool, destination)
+    effective_destination = destination if destination is not None else getattr(request, "destination", None)
+    baseline_failure = _validate_tool_baseline(connection, request.tool, effective_destination)
     if baseline_failure is not None:
         return baseline_failure
 
@@ -241,7 +242,7 @@ def _verify_in_transaction(
 
     try:
         submitted_hash = action_hash(request.action)
-    except ValueError:
+    except (ValueError, ArithmeticError):
         return _blocked("malformed request", "The protected action is invalid.")
     if not hmac.compare_digest(approval["action_hash"], submitted_hash):
         return _blocked(
@@ -293,7 +294,7 @@ def verify_execution(
         _audit(connection, validated_request, decision)
         connection.commit()
         return decision
-    except (sqlite3.Error, TypeError, ValueError):
+    except (sqlite3.Error, TypeError, ValueError, ArithmeticError):
         connection.rollback()
         return _record_fail_closed(
             connection,

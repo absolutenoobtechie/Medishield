@@ -35,5 +35,6 @@ def is_destination_pinned(tool: str, destination: Optional[str] = None) -> bool:
     if tool not in PINNED_DESTINATIONS:
         return False
     if destination is None:
-        return True
+        return False
     return destination == PINNED_DESTINATIONS[tool]
+

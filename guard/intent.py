@@ -51,16 +51,42 @@ def _validated_values(action: ProtectedAction | Mapping[str, Any]) -> dict[str, 
         raise ValueError("protected action is invalid") from exc
 
 
+MAX_DOSE_STRING_LENGTH = 64
+MAX_DOSE_VALUE = Decimal("1000000")
+
+
 def _normalize_dose(value: str) -> str:
+    """Normalize a medication dose string into canonical decimal representation.
+
+    Enforces fail-closed validation:
+    - Input must be a string within reasonable length bounds (<=64 chars).
+    - Value must be finite, strictly positive, and within clinical sanity limits (<=1,000,000).
+    - Arithmetic and conversion errors are safely converted to ValueError.
+    """
+    if not isinstance(value, str):
+        raise ValueError("dose must be a string")
+    trimmed = value.strip()
+    if not trimmed:
+        raise ValueError("dose must not be empty")
+    if len(trimmed) > MAX_DOSE_STRING_LENGTH:
+        raise ValueError(
+            f"dose string length ({len(trimmed)}) exceeds sanity bound of {MAX_DOSE_STRING_LENGTH}"
+        )
+
     try:
-        dose = Decimal(value)
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError("dose must be a finite decimal value") from exc
-    if not dose.is_finite():
-        raise ValueError("dose must be a finite decimal value")
-    if dose.is_zero():
-        return "0"
-    return format(dose.normalize(), "f")
+        dose = Decimal(trimmed)
+        if not dose.is_finite():
+            raise ValueError("dose must be a finite decimal value")
+        if dose <= 0:
+            raise ValueError("dose must be a positive decimal value")
+        if dose > MAX_DOSE_VALUE:
+            raise ValueError(
+                f"dose exceeds clinical sanity upper bound of {MAX_DOSE_VALUE}"
+            )
+        normalized = dose.normalize()
+        return format(normalized, "f")
+    except (ArithmeticError, InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("dose must be a valid, finite, positive decimal value") from exc
 
 
 def canonicalize_action(action: ProtectedAction | Mapping[str, Any]) -> str:

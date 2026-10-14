@@ -57,6 +57,7 @@ def _request(
     approval_id: str,
     request_id: str,
     actor_id: str = "agent_1",
+    destination: str = _PINNED_DESTINATION,
 ) -> ExecutionRequest:
     return ExecutionRequest(
         request_id=request_id,
@@ -64,6 +65,7 @@ def _request(
         tool=_TOOL_NAME,
         approval_id=approval_id,
         action=action,
+        destination=destination,
     )
 
 
@@ -171,7 +173,11 @@ def tamper_dose() -> dict[str, Any]:
         approved_action = _approved_action()
         approval_id = "APR-TAMPER-DOSE"
         _create_approval(connection, approved_action, approval_id)
-        submitted_action = approved_action.copy(update={"dose": "50"})
+        submitted_action = (
+            approved_action.model_copy(update={"dose": "50"})
+            if hasattr(approved_action, "model_copy")
+            else approved_action.copy(update={"dose": "50"})
+        )
         request = _request(submitted_action, approval_id, "REQ-TAMPER-DOSE")
         before = _backend_state(connection)
         decision = gateway.verify_execution(request)
@@ -185,7 +191,11 @@ def substitute_patient() -> dict[str, Any]:
         approved_action = _approved_action()
         approval_id = "APR-PATIENT-SUBSTITUTION"
         _create_approval(connection, approved_action, approval_id)
-        submitted_action = approved_action.copy(update={"patient_id": "P-205"})
+        submitted_action = (
+            approved_action.model_copy(update={"patient_id": "P-205"})
+            if hasattr(approved_action, "model_copy")
+            else approved_action.copy(update={"patient_id": "P-205"})
+        )
         request = _request(
             submitted_action, approval_id, "REQ-PATIENT-SUBSTITUTION"
         )

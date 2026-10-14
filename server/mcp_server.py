@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -113,6 +113,7 @@ def execute_approved_order(
     actor_id: str,
     approval_id: str,
     action: ProtectedAction,
+    destination: Optional[str] = None,
 ) -> dict[str, Any]:
     """Ask the security gateway to verify and execute one approved order.
 
@@ -121,16 +122,18 @@ def execute_approved_order(
     """
 
     validated_action = _action(action)
+    actual_destination = destination if destination is not None else PINNED_DESTINATIONS[UPDATE_ORDER_TOOL]
     request = ExecutionRequest(
         request_id=request_id,
         actor_id=actor_id,
         tool=UPDATE_ORDER_TOOL,
         approval_id=approval_id,
         action=validated_action,
+        destination=actual_destination,
     )
     decision: Decision = verify_execution(
         request,
-        destination=PINNED_DESTINATIONS[UPDATE_ORDER_TOOL],
+        destination=actual_destination,
     )
     return _model_dump(decision)
 

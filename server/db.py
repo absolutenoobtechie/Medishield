@@ -5,16 +5,25 @@ from pathlib import Path
 from typing import Union
 
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
 PathLike = Union[str, Path]
 DEFAULT_DB_PATH = Path("medishield.sqlite3")
 
 
 def get_connection(db_path: PathLike = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Open a SQLite connection with rows addressable by column name."""
+    target = Path(db_path)
+    if not target.is_absolute() and str(target) != ":memory:":
+        # When running inside the MediShield repository workspace (e.g. from dashboard/),
+        # anchor relative paths to the repository root so gateway and dashboard share the same DB.
+        # When running in an isolated temporary directory (e.g. test_attacks.py), keep relative path.
+        cwd = Path.cwd().resolve()
+        if cwd.is_relative_to(ROOT_DIR):
+            target = ROOT_DIR / target
 
-    if str(db_path) != ":memory:":
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(db_path))
+    if str(target) != ":memory:":
+        target.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(target))
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -89,33 +98,70 @@ def seed_data(connection: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO actors(actor_id, role) VALUES (?, ?)",
         [
             ("clinician_1", "clinician"),
+            ("clinician_2", "clinician"),
             ("nurse_1", "nurse"),
             ("agent_1", "agent"),
+            ("pharmacist_1", "pharmacist"),
+            ("service_account_1", "service_account"),
         ],
     )
     connection.executemany(
         "INSERT OR IGNORE INTO patients(patient_id, name_synthetic) VALUES (?, ?)",
         [
-            ("P-104", "Synthetic Patient Alpha"),
-            ("P-205", "Synthetic Patient Beta"),
+            ("P-104", "Synthetic Patient Alpha (John Doe)"),
+            ("P-205", "Synthetic Patient Beta (Jane Smith)"),
+            ("P-318", "Synthetic Patient Gamma (Robert Chen)"),
+            ("P-422", "Synthetic Patient Delta (Maria Garcia)"),
         ],
     )
-    connection.execute(
+    connection.executemany(
         """
         INSERT OR IGNORE INTO orders(
             order_id, patient_id, medication_id, dose, units, route, frequency, duration
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            "ORD-DEMO-001",
-            "P-104",
-            "MED-A",
-            "SIMULATED-5",
-            "synthetic-units",
-            "simulated-route",
-            "demo-only",
-            "demo-duration",
-        ),
+        [
+            (
+                "ORD-DEMO-001",
+                "P-104",
+                "MED-A",
+                "SIMULATED-5",
+                "synthetic-units",
+                "simulated-route",
+                "demo-only",
+                "demo-duration",
+            ),
+            (
+                "ORD-DEMO-002",
+                "P-205",
+                "MED-B",
+                "500",
+                "mg",
+                "oral",
+                "twice daily",
+                "14 days",
+            ),
+            (
+                "ORD-DEMO-003",
+                "P-318",
+                "MED-C",
+                "250",
+                "mg",
+                "oral",
+                "three times daily",
+                "10 days",
+            ),
+            (
+                "ORD-DEMO-004",
+                "P-422",
+                "MED-D",
+                "10",
+                "mg",
+                "subcutaneous",
+                "daily",
+                "30 days",
+            ),
+        ],
     )
     connection.commit()
 

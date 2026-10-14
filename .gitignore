@@ -1,4 +1,5 @@
 .venv/
+.venv-bundled/
 __pycache__/
 *.py[cod]
 *.sqlite3

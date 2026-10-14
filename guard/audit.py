@@ -66,7 +66,8 @@ def record_audit_event(
                 state_changed,
             ),
         )
-        connection.commit()
+        if close_after:
+            connection.commit()
         return cursor.lastrowid or 0
     finally:
         if close_after:

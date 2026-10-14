@@ -1,29 +1,272 @@
 """Runtime decision point for execution requests."""
 
-from datetime import datetime, timezone
+from __future__ import annotations
+
 import hmac
 import json
 import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from server.backend import execute
 from server.db import DEFAULT_DB_PATH, get_connection
+
 from .audit import record_audit_event
 from .intent import action_hash, canonicalize_action
 from .models import Decision, ExecutionRequest, ProtectedAction
-from .policy import is_destination_pinned, is_role_permitted
+from .policy import PINNED_DESTINATIONS, is_role_permitted
 
 
-def _find_changed_fields(action_req: ProtectedAction, approved_dict: Dict[str, Any]) -> List[str]:
-    """Identify which protected action fields differ from the stored approval."""
-    req_dict = action_req.model_dump() if hasattr(action_req, "model_dump") else action_req.dict()
-    changed: List[str] = []
-    for key, req_val in req_dict.items():
-        app_val = approved_dict.get(key)
-        # Compare canonical strings
-        if str(req_val).strip().lower() != str(app_val).strip().lower():
-            changed.append(key)
-    return sorted(changed)
+_TRUSTED_TOOL_BASELINES = {
+    "update_order": {
+        "fingerprint": "sha256:medishield-demo-tool-v1",
+        "destination": PINNED_DESTINATIONS["update_order"],
+    }
+}
+
+
+def _model_fields(model_type: Any) -> tuple[str, ...]:
+    fields = getattr(model_type, "model_fields", None)
+    if fields is None:  # Pydantic v1 compatibility.
+        fields = model_type.__fields__
+    return tuple(fields)
+
+
+def _model_dump(model: Any) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def _validate_request(request: ExecutionRequest) -> ExecutionRequest:
+    """Revalidate a request so ``model_construct`` cannot bypass strictness."""
+
+    if not isinstance(request, ExecutionRequest):
+        raise ValueError("request must use the ExecutionRequest model")
+    if getattr(request, "model_extra", None):
+        raise ValueError("request contains unexpected fields")
+    if not isinstance(request.action, ProtectedAction):
+        raise ValueError("request action must use the ProtectedAction model")
+    if getattr(request.action, "model_extra", None):
+        raise ValueError("request action contains unexpected fields")
+
+    payload = _model_dump(request)
+    if set(payload) != set(_model_fields(ExecutionRequest)):
+        raise ValueError("request fields do not match the contract")
+    try:
+        if hasattr(ExecutionRequest, "model_validate"):
+            return ExecutionRequest.model_validate(payload)
+        return ExecutionRequest.parse_obj(payload)
+    except Exception as exc:
+        raise ValueError("request is invalid") from exc
+
+
+def _decision(
+    decision: str,
+    rule: str,
+    reason: str,
+    changed_fields: list[str] | None = None,
+    state_changed: bool = False,
+) -> Decision:
+    return Decision(
+        decision=decision,
+        rule=rule,
+        reason=reason,
+        changed_fields=changed_fields or [],
+        state_changed=state_changed,
+    )
+
+
+def _blocked(rule: str, reason: str, changed_fields: list[str] | None = None) -> Decision:
+    return _decision("blocked", rule, reason, changed_fields)
+
+
+def _risk_for(rule: str) -> str:
+    if rule in {"intent hash mismatch", "destination not pinned", "tool description not pinned"}:
+        return "high"
+    return "medium"
+
+
+def _request_metadata(request: Any) -> tuple[str, str, str, str | None]:
+    if isinstance(request, ExecutionRequest):
+        return request.request_id, request.actor_id, request.tool, request.approval_id
+    return "invalid-request", "unknown", "unknown", None
+
+
+def _audit(connection: sqlite3.Connection, request: Any, decision: Decision) -> None:
+    """Write an audit event in the same transaction as the outcome."""
+
+    request_id, actor_id, tool, approval_id = _request_metadata(request)
+    record_audit_event(
+        {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "actor": actor_id,
+            "tool": tool,
+            "action_type": tool,
+            "approval_id": approval_id,
+            "decision": decision.decision,
+            "risk": _risk_for(decision.rule),
+            "rule": decision.rule,
+            "reason": decision.reason,
+            "changed_fields": decision.changed_fields,
+            "state_changed": decision.state_changed,
+        },
+        connection,
+    )
+
+
+def _record_fail_closed(
+    connection: sqlite3.Connection, request: Any, decision: Decision
+) -> Decision:
+    """Persist a blocked result when the normal verification transaction failed."""
+
+    try:
+        _audit(connection, request, decision)
+        connection.commit()
+    except sqlite3.Error:
+        connection.rollback()
+    return decision
+
+
+def _parse_expiry(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("approval expiry must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _changed_fields(stored_action_json: str, action: ProtectedAction) -> list[str]:
+    """Return canonical protected fields that differ from the approved action."""
+
+    try:
+        approved = json.loads(canonicalize_action(json.loads(stored_action_json)))
+        submitted = json.loads(canonicalize_action(action))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return list(_model_fields(ProtectedAction))
+    return [field for field in _model_fields(ProtectedAction) if approved[field] != submitted[field]]
+
+
+def _validate_tool_baseline(
+    connection: sqlite3.Connection, tool: str, destination: Optional[str]
+) -> Decision | None:
+    """Check the immutable policy baseline and an optional persisted baseline."""
+
+    trusted = _TRUSTED_TOOL_BASELINES.get(tool)
+    if trusted is None:
+        return _blocked("tool not pinned", "The requested tool is not a pinned tool.")
+    if destination is not None and not hmac.compare_digest(destination, trusted["destination"]):
+        return _blocked(
+            "destination not pinned",
+            "The requested destination differs from the trusted baseline.",
+        )
+
+    baseline = connection.execute(
+        "SELECT fingerprint, allowed_destination FROM tool_baseline WHERE tool_name = ?",
+        (tool,),
+    ).fetchone()
+    # The policy map is the baseline for deployments without a table row. A
+    # registered row must match it exactly and cannot override it.
+    if baseline is None:
+        return None
+    if not hmac.compare_digest(baseline["fingerprint"], trusted["fingerprint"]):
+        return _blocked(
+            "tool description not pinned",
+            "The tool fingerprint differs from the trusted baseline.",
+        )
+    if not hmac.compare_digest(baseline["allowed_destination"], trusted["destination"]):
+        return _blocked(
+            "destination not pinned",
+            "The tool destination differs from the trusted baseline.",
+        )
+    return None
+
+
+def _canonical_request(request: ExecutionRequest) -> ExecutionRequest:
+    """Use normalized protected values when writing the simulated backend."""
+
+    action_payload = json.loads(canonicalize_action(request.action))
+    payload = _model_dump(request)
+    payload["action"] = action_payload
+    if hasattr(ExecutionRequest, "model_validate"):
+        return ExecutionRequest.model_validate(payload)
+    return ExecutionRequest.parse_obj(payload)
+
+
+def _verify_in_transaction(
+    connection: sqlite3.Connection, request: ExecutionRequest, destination: Optional[str]
+) -> Decision:
+    """Apply the documented security checks in order within one transaction."""
+
+    actor = connection.execute(
+        "SELECT role FROM actors WHERE actor_id = ?", (request.actor_id,)
+    ).fetchone()
+    if actor is None:
+        return _blocked("actor not registered", "The actor is not in the authorized directory.")
+    if not is_role_permitted(request.tool, actor["role"]):
+        return _blocked(
+            "role not permitted",
+            "This actor role is not permitted to execute the requested tool.",
+        )
+
+    baseline_failure = _validate_tool_baseline(connection, request.tool, destination)
+    if baseline_failure is not None:
+        return baseline_failure
+
+    approval = connection.execute(
+        """
+        SELECT action_hash, action_json, approver_id, expires_at, revoked, consumed
+        FROM approvals WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone()
+    if approval is None:
+        return _blocked("approval not found", "No approval exists for this request.")
+    try:
+        expires_at = _parse_expiry(approval["expires_at"])
+    except (AttributeError, TypeError, ValueError):
+        return _blocked("approval invalid", "The approval expiry is invalid.")
+    if expires_at <= datetime.now(timezone.utc):
+        return _blocked("approval expired", "The approval is outside its validity window.")
+    if approval["revoked"]:
+        return _blocked("approval revoked", "The clinician approval has been revoked.")
+    if approval["consumed"]:
+        return _blocked("approval already consumed", "The one-time approval was already used.")
+
+    approver = connection.execute(
+        "SELECT role FROM actors WHERE actor_id = ?", (approval["approver_id"],)
+    ).fetchone()
+    if approver is None or approver["role"] != "clinician":
+        return _blocked("approval invalid", "The approval was not issued by a clinician.")
+
+    try:
+        submitted_hash = action_hash(request.action)
+    except ValueError:
+        return _blocked("malformed request", "The protected action is invalid.")
+    if not hmac.compare_digest(approval["action_hash"], submitted_hash):
+        return _blocked(
+            "intent hash mismatch",
+            "The protected action differs from the clinician approval.",
+            _changed_fields(approval["action_json"], request.action),
+        )
+
+    consumed = connection.execute(
+        """
+        UPDATE approvals SET consumed = 1
+        WHERE approval_id = ? AND consumed = 0 AND revoked = 0
+        """,
+        (request.approval_id,),
+    ).rowcount
+    if consumed != 1:
+        return _blocked("approval already consumed", "The one-time approval was already used.")
+
+    execute(_canonical_request(request), connection)
+    return _decision(
+        "allowed",
+        "intent hash matched",
+        "The protected action matched the clinician approval and was executed.",
+        state_changed=True,
+    )
 
 
 def verify_execution(
@@ -31,212 +274,35 @@ def verify_execution(
     connection: Optional[sqlite3.Connection] = None,
     destination: Optional[str] = None,
 ) -> Decision:
-    """Verify an execution request before it can reach the backend.
+    """Verify, audit, and atomically execute a synthetic approved action."""
 
-    Implements the fail-closed check order from ``docs/CONTRACT.md``:
-    1. Validate request schema.
-    2. Validate actor's role.
-    3. Pin tool and destination.
-    4. Validate approval existence, validity window, revocation, consumption.
-    5. Recompute and compare action hash using hmac.compare_digest.
-    6. Atomically consume approval and write backend state.
-    7. Audit every outcome.
-    8. Fail closed on any safety failure.
-    """
-    close_after = False
-    if connection is None:
-        connection = get_connection(DEFAULT_DB_PATH)
-        close_after = True
-
+    close_after = connection is None
+    connection = connection if connection is not None else get_connection(DEFAULT_DB_PATH)
     try:
-        # Step 1: Request schema validation
-        if not isinstance(request, ExecutionRequest):
-            return _fail_closed(
-                request, "malformed request", "Invalid execution request schema.", connection
-            )
-
-        cursor = connection.cursor()
-
-        # Step 2: Validate actor's role
-        cursor.execute("SELECT role FROM actors WHERE actor_id = ?", (request.actor_id,))
-        actor_row = cursor.fetchone()
-        if not actor_row:
-            return _fail_closed(
-                request,
-                "actor not registered",
-                f"Actor '{request.actor_id}' is not in the authorized directory.",
-                connection,
-            )
-
-        actor_role = actor_row["role"]
-        if not is_role_permitted(request.tool, actor_role):
-            return _fail_closed(
-                request,
-                "role not permitted",
-                f"Actor role '{actor_role}' is not permitted to execute tool '{request.tool}'.",
-                connection,
-            )
-
-        # Step 3: Pin tool and destination
-        if not is_destination_pinned(request.tool, destination):
-            return _fail_closed(
-                request,
-                "destination not pinned",
-                f"The tool destination '{destination}' does not match the pinned baseline.",
-                connection,
-            )
-
-        # Step 4: Validate approval
-        cursor.execute("SELECT * FROM approvals WHERE approval_id = ?", (request.approval_id,))
-        approval_row = cursor.fetchone()
-        if not approval_row:
-            return _fail_closed(
-                request,
-                "approval not found",
-                f"Approval identifier '{request.approval_id}' was not found.",
-                connection,
-            )
-
-        if approval_row["revoked"]:
-            return _fail_closed(
-                request,
-                "approval revoked",
-                "The clinician approval has been revoked.",
-                connection,
-            )
-
-        if approval_row["consumed"]:
-            return _fail_closed(
-                request,
-                "approval already consumed",
-                "The one-time synthetic approval was already used.",
-                connection,
-            )
-
-        # Check expiration if present
-        expires_at_str = approval_row["expires_at"]
-        if expires_at_str:
-            try:
-                exp_dt = datetime.fromisoformat(expires_at_str)
-                now_dt = datetime.now(timezone.utc)
-                if exp_dt.tzinfo is None:
-                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-                if now_dt > exp_dt:
-                    return _fail_closed(
-                        request,
-                        "approval expired",
-                        "The synthetic approval was outside its validity window.",
-                        connection,
-                    )
-            except Exception:
-                pass
-
-        # Step 5: Recompute protected-action hash and compare with stored approval
-        approved_hash = approval_row["action_hash"]
-        approved_json_str = approval_row["action_json"]
         try:
-            approved_dict = json.loads(approved_json_str)
-        except Exception:
-            approved_dict = {}
-
-        computed_hash = action_hash(request.action)
-        if not hmac.compare_digest(computed_hash, approved_hash):
-            changed_fields = _find_changed_fields(request.action, approved_dict)
-            return _fail_closed(
-                request,
-                "intent hash mismatch",
-                "The execution parameters differed from the approved synthetic action.",
+            validated_request = _validate_request(request)
+        except ValueError:
+            return _record_fail_closed(
                 connection,
-                changed_fields=changed_fields,
+                request,
+                _blocked("malformed request", "The execution request is invalid."),
             )
 
-        # Check for non-canonical units warning
-        is_warning = False
-        rule = "intent hash matched"
-        reason = "Protected order fields matched the clinician approval."
-        raw_units = request.action.units
-        if raw_units != raw_units.lower():
-            is_warning = True
-            rule = "non-canonical units"
-            reason = "The request used mixed-case units and requires canonicalization review."
-
-        decision_str = "warning" if is_warning else "allowed"
-
-        # Step 6: Atomically consume approval and write backend state
-        cursor.execute(
-            "UPDATE approvals SET consumed = 1 WHERE approval_id = ?",
-            (request.approval_id,),
-        )
-        execute(request, connection)
+        connection.execute("BEGIN IMMEDIATE")
+        decision = _verify_in_transaction(connection, validated_request, destination)
+        _audit(connection, validated_request, decision)
         connection.commit()
-
-        # Step 7: Audit allowed/warning outcome
-        audit_event = {
-            "time": datetime.now(timezone.utc).isoformat(),
-            "request_id": request.request_id,
-            "actor": request.actor_id,
-            "tool": request.tool,
-            "action_type": "update_order",
-            "approval_id": request.approval_id,
-            "decision": decision_str,
-            "risk": "low" if not is_warning else "medium",
-            "rule": rule,
-            "reason": reason,
-            "changed_fields": [],
-            "state_changed": True,
-        }
-        record_audit_event(audit_event, connection)
-
-        return Decision(
-            decision=decision_str,
-            rule=rule,
-            reason=reason,
-            changed_fields=[],
-            state_changed=True,
-        )
-
-    except Exception as exc:
-        # Step 8: Fail closed on unexpected exception
-        return _fail_closed(
-            request, "fail closed", f"Gateway internal verification error: {exc}", connection
+        return decision
+    except (sqlite3.Error, TypeError, ValueError):
+        connection.rollback()
+        return _record_fail_closed(
+            connection,
+            request,
+            _blocked(
+                "verification failed",
+                "The request could not be verified safely and was not executed.",
+            ),
         )
     finally:
         if close_after:
             connection.close()
-
-
-def _fail_closed(
-    request: ExecutionRequest,
-    rule: str,
-    reason: str,
-    connection: sqlite3.Connection,
-    changed_fields: Optional[List[str]] = None,
-) -> Decision:
-    """Guarantee fail-closed behavior: record blocked audit event and leave state unchanged."""
-    cf = changed_fields or []
-    audit_event = {
-        "time": datetime.now(timezone.utc).isoformat(),
-        "request_id": request.request_id if hasattr(request, "request_id") else "UNKNOWN",
-        "actor": request.actor_id if hasattr(request, "actor_id") else "UNKNOWN",
-        "tool": request.tool if hasattr(request, "tool") else "UNKNOWN",
-        "action_type": "update_order",
-        "approval_id": getattr(request, "approval_id", None),
-        "decision": "blocked",
-        "risk": "high" if "mismatch" in rule or "tamper" in rule else "medium",
-        "rule": rule,
-        "reason": reason,
-        "changed_fields": cf,
-        "state_changed": False,
-    }
-    try:
-        record_audit_event(audit_event, connection)
-    except Exception:
-        pass
-
-    return Decision(
-        decision="blocked",
-        rule=rule,
-        reason=reason,
-        changed_fields=cf,
-        state_changed=False,
-    )

@@ -44,7 +44,8 @@ def execute(request: ExecutionRequest, connection: Optional[sqlite3.Connection] 
                 action.duration,
             ),
         )
-        connection.commit()
+        if close_after:
+            connection.commit()
     finally:
         if close_after:
             connection.close()

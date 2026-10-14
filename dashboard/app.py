@@ -1069,7 +1069,7 @@ with tab_verification:
 
 
 
-    if is_live_context and (run_check or "last_loaded_preset" in st.session_state):
+        if gw_health["healthy"] and (run_check or "last_loaded_preset" in st.session_state):
         def clean_val(v, default=""):
             s = str(v).strip() if v is not None else ""
             return s if s else default

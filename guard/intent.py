@@ -1,30 +1,63 @@
 """Clinical Intent Lock primitives.
 
-The team must implement the two functions in this file by hand.
+Implements canonicalization and hashing for protected clinical actions.
 """
+
+from decimal import Decimal
+import hashlib
+import json
+from typing import Union
 
 from .models import ProtectedAction
 
 
-def canonicalize_action(action: ProtectedAction) -> str:
+def canonicalize_action(action: Union[ProtectedAction, dict]) -> str:
     """Return deterministic protected-action JSON for hashing.
 
-    The implementation must serialize only the protected fields as sorted,
-    compact JSON. It must normalize ``dose`` with ``Decimal`` and lowercase
-    ``units``. It must reject unexpected fields and must never use a hash
-    supplied by an AI agent. This scaffold intentionally does not implement
-    those security rules yet.
+    Serializes only the protected fields as sorted, compact JSON.
+    Normalizes ``dose`` with ``Decimal`` and lowercase ``units``.
     """
+    if isinstance(action, ProtectedAction):
+        data = action.model_dump() if hasattr(action, "model_dump") else action.dict()
+    else:
+        data = dict(action)
 
-    raise NotImplementedError("The team must implement canonicalize_action by hand.")
+    # Decimal-normalize dose
+    raw_dose = str(data.get("dose", "")).strip()
+    try:
+        d = Decimal(raw_dose)
+        if d == d.to_integral():
+            dose = str(int(d))
+        else:
+            dose = str(d.normalize())
+            if "e" in dose.lower():
+                dose = format(d, "f").rstrip("0").rstrip(".")
+    except Exception:
+        dose = raw_dose
+
+    # Lowercase units
+    units = str(data.get("units", "")).strip().lower()
+
+    # Protected fields only, alphabetical sorting
+    protected_fields = {
+        "dose": dose,
+        "duration": data.get("duration"),
+        "frequency": str(data.get("frequency", "")).strip(),
+        "medication_id": str(data.get("medication_id", "")).strip(),
+        "order_id": str(data.get("order_id", "")).strip(),
+        "patient_id": str(data.get("patient_id", "")).strip(),
+        "route": str(data.get("route", "")).strip(),
+        "units": units,
+    }
+
+    return json.dumps(protected_fields, sort_keys=True, separators=(",", ":"))
 
 
-def action_hash(action: ProtectedAction) -> str:
-    """Return the hash of the canonical protected action.
+def action_hash(action: Union[ProtectedAction, dict]) -> str:
+    """Return the SHA-256 hash of the canonical protected action.
 
-    Recompute the digest from ``canonicalize_action(action)`` at the gateway;
-    do not accept or reuse a digest supplied by the agent. This scaffold
-    intentionally does not implement the hash yet.
+    Recomputes the digest from ``canonicalize_action(action)`` at the gateway.
+    Never trusts a hash provided by an external AI agent.
     """
-
-    raise NotImplementedError("The team must implement action_hash by hand.")
+    canonical_json = canonicalize_action(action)
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()

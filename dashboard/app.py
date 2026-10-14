@@ -696,7 +696,7 @@ with tab_verification:
     run_check = st.button("🔒 Run Gateway Intent Lock Check", type="primary", use_container_width=True)
 
     # Run verification check
-    if run_check or "last_loaded_preset" in st.session_state:
+    if run_check:
         from decimal import Decimal
 
         def clean_val(v):

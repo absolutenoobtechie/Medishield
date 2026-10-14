@@ -4,3 +4,4 @@ __pycache__/
 *.sqlite3
 .pytest_cache/
 logs/events.jsonl
+work/

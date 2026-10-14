@@ -20,6 +20,13 @@ PINNED_DESTINATIONS: Dict[str, str] = {
     "dispense_simulated": "backend://simulated-pharmacy/dispense",
 }
 
+# The SQLite baseline must contain this exact fingerprint for protected tools.
+# This is a synthetic demo fingerprint, not a claim that every form of tool
+# poisoning can be detected.
+TOOL_BASELINE_FINGERPRINTS: Dict[str, str] = {
+    "update_order": "sha256:medishield-demo-tool-v1",
+}
+
 
 def is_role_permitted(tool: str, role: str) -> bool:
     """Check if the given actor role is permitted to execute the tool."""

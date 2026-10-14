@@ -5,6 +5,7 @@ import pytest
 from demo.attacks import (
     changed_destination,
     expired_approval,
+    guard_off_vs_guard_on,
     prompt_injection_note,
     replay_consumed_approval,
     revoked_approval,
@@ -57,3 +58,16 @@ def test_valid_action_is_allowed():
     result = valid_action()
 
     assert result["decision"] == "allowed"
+
+
+def test_guard_off_comparison_uses_real_backend_and_gateway():
+    result = guard_off_vs_guard_on()
+
+    assert result["guard_off"]["decision"] == "bypassed"
+    assert result["guard_off"]["state_changed"] is True
+    assert result["guard_off"]["backend_state_before"] != result["guard_off"]["backend_state_after"]
+
+    assert result["guard_on"]["decision"] == "blocked"
+    assert result["guard_on"]["rule"] == "intent hash mismatch"
+    assert result["guard_on"]["state_changed"] is False
+    assert result["guard_on"]["backend_state_before"] == result["guard_on"]["backend_state_after"]

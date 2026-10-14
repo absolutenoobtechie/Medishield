@@ -6,16 +6,15 @@ from pydantic import BaseModel
 
 try:
     from pydantic import ConfigDict
-    _model_config = ConfigDict(extra="forbid")
 except ImportError:
-    _model_config = None
+    ConfigDict = None
 
 
 class _StrictModel(BaseModel):
     """Base model that rejects fields not in the contract."""
 
-    if _model_config is not None:
-        model_config = _model_config
+    if hasattr(BaseModel, "model_validate") and ConfigDict is not None:
+        model_config = ConfigDict(extra="forbid")
     else:
         class Config:
             extra = "forbid"

@@ -10,7 +10,7 @@ from server.db import DEFAULT_DB_PATH, PathLike, get_connection, init_db
 
 
 DATABASE_PATH: PathLike = DEFAULT_DB_PATH
-LOG_PATH = Path("logs/events.jsonl")
+LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "events.jsonl"
 AUDIT_FIELDS = (
     "time",
     "request_id",
@@ -158,7 +158,7 @@ def write_event(
         if owns_connection:
             current.commit()
         return int(cursor.lastrowid or 0)
-    except Exception:
+    except (OSError, sqlite3.Error, TypeError, ValueError):
         if owns_connection:
             current.rollback()
         raise

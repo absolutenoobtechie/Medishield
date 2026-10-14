@@ -271,6 +271,205 @@ def test_incorrect_destination_is_blocked(test_db):
     assert event["state_changed"] == 0
 
 
+def test_missing_tool_baseline_is_blocked_without_state_change(test_db):
+    action_dict = {
+        "order_id": "ORD-DEMO-001",
+        "patient_id": "P-104",
+        "medication_id": "MED-A",
+        "dose": "5",
+        "units": "mg",
+        "route": "oral",
+        "frequency": "daily",
+        "duration": "7 days",
+    }
+    create_approval(test_db, "APR-TEST-MISSING-BASELINE", action_dict)
+    test_db.execute("DELETE FROM tool_baseline WHERE tool_name = 'update_order'")
+    test_db.commit()
+
+    before = test_db.execute(
+        "SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'"
+    ).fetchone()["dose"]
+    request = ExecutionRequest(
+        request_id="REQ-TEST-MISSING-BASELINE",
+        actor_id="agent_1",
+        tool="update_order",
+        approval_id="APR-TEST-MISSING-BASELINE",
+        action=ProtectedAction(**action_dict),
+        destination=DESTINATION,
+    )
+
+    decision = verify_execution(request, test_db, destination=DESTINATION)
+
+    assert decision.decision == "blocked"
+    assert decision.rule == "tool baseline missing"
+    assert decision.state_changed is False
+    assert test_db.execute(
+        "SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'"
+    ).fetchone()["dose"] == before
+    assert test_db.execute(
+        "SELECT consumed FROM approvals WHERE approval_id = ?",
+        ("APR-TEST-MISSING-BASELINE",),
+    ).fetchone()["consumed"] == 0
+
+
+def test_changed_tool_fingerprint_is_blocked(test_db):
+    action_dict = {
+        "order_id": "ORD-DEMO-001",
+        "patient_id": "P-104",
+        "medication_id": "MED-A",
+        "dose": "5",
+        "units": "mg",
+        "route": "oral",
+        "frequency": "daily",
+        "duration": "7 days",
+    }
+    create_approval(test_db, "APR-TEST-BAD-FINGERPRINT", action_dict)
+    test_db.execute(
+        "UPDATE tool_baseline SET fingerprint = ? WHERE tool_name = ?",
+        ("sha256:changed-by-test", "update_order"),
+    )
+    test_db.commit()
+
+    request = ExecutionRequest(
+        request_id="REQ-TEST-BAD-FINGERPRINT",
+        actor_id="agent_1",
+        tool="update_order",
+        approval_id="APR-TEST-BAD-FINGERPRINT",
+        action=ProtectedAction(**action_dict),
+        destination=DESTINATION,
+    )
+    decision = verify_execution(request, test_db, destination=DESTINATION)
+
+    assert decision.decision == "blocked"
+    assert decision.rule == "tool description not pinned"
+    assert decision.state_changed is False
+
+
+def test_missing_structured_field_is_blocked_without_consuming_approval(test_db):
+    action_dict = {
+        "order_id": "ORD-DEMO-001",
+        "patient_id": "P-104",
+        "medication_id": "MED-A",
+        "dose": "5",
+        "units": "mg",
+        "route": "oral",
+        "frequency": "daily",
+        "duration": "7 days",
+    }
+    create_approval(test_db, "APR-TEST-MISSING-FIELD", action_dict)
+    construct = getattr(ProtectedAction, "model_construct", ProtectedAction.construct)
+    malformed_action = construct(
+        order_id="ORD-DEMO-001",
+        patient_id="P-104",
+        medication_id="MED-A",
+        units="mg",
+        route="oral",
+        frequency="daily",
+        duration="7 days",
+    )
+    request_construct = getattr(ExecutionRequest, "model_construct", ExecutionRequest.construct)
+    request = request_construct(
+        request_id="REQ-TEST-MISSING-FIELD",
+        actor_id="agent_1",
+        tool="update_order",
+        approval_id="APR-TEST-MISSING-FIELD",
+        action=malformed_action,
+        destination=DESTINATION,
+    )
+
+    decision = verify_execution(request, test_db, destination=DESTINATION)
+
+    assert decision.decision == "blocked"
+    assert decision.rule == "malformed request"
+    assert decision.state_changed is False
+    assert test_db.execute(
+        "SELECT consumed FROM approvals WHERE approval_id = ?",
+        ("APR-TEST-MISSING-FIELD",),
+    ).fetchone()["consumed"] == 0
+
+
+def test_audit_failure_rolls_back_order_and_approval(test_db, monkeypatch):
+    action_dict = {
+        "order_id": "ORD-DEMO-001",
+        "patient_id": "P-104",
+        "medication_id": "MED-A",
+        "dose": "5",
+        "units": "mg",
+        "route": "oral",
+        "frequency": "daily",
+        "duration": "7 days",
+    }
+    create_approval(test_db, "APR-TEST-AUDIT-FAILURE", action_dict)
+
+    import guard.audit as audit
+
+    def fail_log(*args, **kwargs):
+        raise OSError("synthetic audit log failure")
+
+    monkeypatch.setattr(audit, "_append_jsonl", fail_log)
+    request = ExecutionRequest(
+        request_id="REQ-TEST-AUDIT-FAILURE",
+        actor_id="agent_1",
+        tool="update_order",
+        approval_id="APR-TEST-AUDIT-FAILURE",
+        action=ProtectedAction(**action_dict),
+        destination=DESTINATION,
+    )
+    decision = verify_execution(request, test_db, destination=DESTINATION)
+
+    assert decision.decision == "blocked"
+    assert decision.rule == "verification failed"
+    assert decision.state_changed is False
+    assert test_db.execute(
+        "SELECT consumed FROM approvals WHERE approval_id = ?",
+        ("APR-TEST-AUDIT-FAILURE",),
+    ).fetchone()["consumed"] == 0
+    assert test_db.execute(
+        "SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'"
+    ).fetchone()["dose"] == "SIMULATED-5"
+
+
+def test_backend_failure_rolls_back_order_and_approval(test_db, monkeypatch):
+    action_dict = {
+        "order_id": "ORD-DEMO-001",
+        "patient_id": "P-104",
+        "medication_id": "MED-A",
+        "dose": "5",
+        "units": "mg",
+        "route": "oral",
+        "frequency": "daily",
+        "duration": "7 days",
+    }
+    create_approval(test_db, "APR-TEST-BACKEND-FAILURE", action_dict)
+
+    import guard.gateway as gateway
+
+    def fail_backend(*args, **kwargs):
+        raise sqlite3.OperationalError("synthetic backend failure")
+
+    monkeypatch.setattr(gateway, "execute", fail_backend)
+    request = ExecutionRequest(
+        request_id="REQ-TEST-BACKEND-FAILURE",
+        actor_id="agent_1",
+        tool="update_order",
+        approval_id="APR-TEST-BACKEND-FAILURE",
+        action=ProtectedAction(**action_dict),
+        destination=DESTINATION,
+    )
+
+    decision = verify_execution(request, test_db, destination=DESTINATION)
+
+    assert decision.decision == "blocked"
+    assert decision.rule == "verification failed"
+    assert test_db.execute(
+        "SELECT consumed FROM approvals WHERE approval_id = ?",
+        ("APR-TEST-BACKEND-FAILURE",),
+    ).fetchone()["consumed"] == 0
+    assert test_db.execute(
+        "SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'"
+    ).fetchone()["dose"] == "SIMULATED-5"
+
+
 @pytest.mark.parametrize(
     "bad_dose",
     [

@@ -17,6 +17,12 @@ MediShield is a runtime security gateway between an AI agent and a simulated cli
 - Never trust a hash supplied by the agent. Recompute it from the protected action at the gateway.
 - The canonical hash must use sorted, compact JSON, Decimal-normalised `dose`, and lowercase `units`.
 - Compare hashes with `hmac.compare_digest`.
+- The protected dose input is a string, must be finite and positive, and is
+  limited to 64 characters and a value of at most 1,000,000 for this demo.
+- The default SQLite database is repository-root based so changing the
+  working directory does not silently select a second application database.
+- The SQLite `tool_baseline` row for `update_order` must exist and match the
+  trusted synthetic fingerprint and destination before execution.
 - AI is for boilerplate only. The team writes the two core security functions by hand:
   - `guard/intent.py`: `canonicalize_action` and `action_hash`
   - `guard/gateway.py`: `verify_execution`

@@ -14,12 +14,16 @@ from server.db import DEFAULT_DB_PATH, get_connection
 from .audit import record_audit_event
 from .intent import action_hash, canonicalize_action
 from .models import Decision, ExecutionRequest, ProtectedAction
-from .policy import PINNED_DESTINATIONS, is_role_permitted
+from .policy import (
+    PINNED_DESTINATIONS,
+    TOOL_BASELINE_FINGERPRINTS,
+    is_role_permitted,
+)
 
 
 _TRUSTED_TOOL_BASELINES = {
     "update_order": {
-        "fingerprint": "sha256:medishield-demo-tool-v1",
+        "fingerprint": TOOL_BASELINE_FINGERPRINTS["update_order"],
         "destination": PINNED_DESTINATIONS["update_order"],
     }
 }
@@ -57,7 +61,7 @@ def _validate_request(request: ExecutionRequest) -> ExecutionRequest:
         if hasattr(ExecutionRequest, "model_validate"):
             return ExecutionRequest.model_validate(payload)
         return ExecutionRequest.parse_obj(payload)
-    except Exception as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError("request is invalid") from exc
 
 
@@ -124,8 +128,11 @@ def _record_fail_closed(
     try:
         _audit(connection, request, decision)
         connection.commit()
-    except sqlite3.Error:
-        connection.rollback()
+    except (sqlite3.Error, OSError):
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
     return decision
 
 
@@ -165,10 +172,12 @@ def _validate_tool_baseline(
         "SELECT fingerprint, allowed_destination FROM tool_baseline WHERE tool_name = ?",
         (tool,),
     ).fetchone()
-    # The policy map is the baseline for deployments without a table row. A
-    # registered row must match it exactly and cannot override it.
+    # A missing row is unsafe: the database must explicitly pin the tool.
     if baseline is None:
-        return None
+        return _blocked(
+            "tool baseline missing",
+            "The trusted tool baseline is not registered in the database.",
+        )
     if not hmac.compare_digest(baseline["fingerprint"], trusted["fingerprint"]):
         return _blocked(
             "tool description not pinned",
@@ -294,8 +303,11 @@ def verify_execution(
         _audit(connection, validated_request, decision)
         connection.commit()
         return decision
-    except (sqlite3.Error, TypeError, ValueError, ArithmeticError):
-        connection.rollback()
+    except (sqlite3.Error, TypeError, ValueError, ArithmeticError, OSError):
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
         return _record_fail_closed(
             connection,
             request,

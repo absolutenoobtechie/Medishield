@@ -6,7 +6,8 @@ from typing import Union
 
 
 PathLike = Union[str, Path]
-DEFAULT_DB_PATH = Path("medishield.sqlite3")
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DB_PATH = REPOSITORY_ROOT / "medishield.sqlite3"
 
 
 def get_connection(db_path: PathLike = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -102,20 +103,38 @@ def seed_data(connection: sqlite3.Connection) -> None:
     )
     # Keep apply_order as the only order-table writer, including for demo data.
     from guard.models import ProtectedAction
+    from guard.policy import PINNED_DESTINATIONS, TOOL_BASELINE_FINGERPRINTS
     from .backend import apply_order
 
-    apply_order(
-        ProtectedAction(
-            patient_id="P-104",
-            medication_id="MED-A",
-            dose="SIMULATED-5",
-            units="synthetic-units",
-            route="simulated-route",
-            frequency="demo-only",
-            duration="demo-duration",
-            order_id="ORD-DEMO-001",
+    existing_order = connection.execute(
+        "SELECT 1 FROM orders WHERE order_id = ?",
+        ("ORD-DEMO-001",),
+    ).fetchone()
+    if existing_order is None:
+        apply_order(
+            ProtectedAction(
+                patient_id="P-104",
+                medication_id="MED-A",
+                dose="SIMULATED-5",
+                units="synthetic-units",
+                route="simulated-route",
+                frequency="demo-only",
+                duration="demo-duration",
+                order_id="ORD-DEMO-001",
+            ),
+            connection=connection,
+        )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO tool_baseline(
+            tool_name, fingerprint, allowed_destination
+        ) VALUES (?, ?, ?)
+        """,
+        (
+            "update_order",
+            TOOL_BASELINE_FINGERPRINTS["update_order"],
+            PINNED_DESTINATIONS["update_order"],
         ),
-        connection=connection,
     )
     connection.commit()
 

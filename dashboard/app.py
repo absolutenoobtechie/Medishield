@@ -35,7 +35,7 @@ def to_ist_string(time_val: Any) -> str:
             dt = dt.replace(tzinfo=timezone.utc)
         ist_dt = dt.astimezone(IST_TZ)
         return ist_dt.strftime("%Y-%m-%d %H:%M:%S IST")
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return str(time_val)
 
 
@@ -46,21 +46,27 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from guard.audit import record_audit_event
 from guard.gateway import verify_execution
 from guard.intent import action_hash, canonicalize_action
 from guard.models import Decision, ExecutionRequest, ProtectedAction
 from guard.policy import PINNED_DESTINATIONS
+from demo.attacks import guard_off_vs_guard_on
 from server.db import DEFAULT_DB_PATH, get_connection, init_db, seed_data
 
+DATABASE_PATH = Path(DEFAULT_DB_PATH)
+
 # Ensure synthetic DB tables and baseline seed data exist
+_DATABASE_INIT_ERROR: Optional[str] = None
+_conn = None
 try:
-    _conn = get_connection(ROOT_DIR / DEFAULT_DB_PATH)
+    _conn = get_connection(DATABASE_PATH)
     init_db(_conn)
     seed_data(_conn)
-    _conn.close()
-except Exception:
-    pass
+except (OSError, sqlite3.Error) as exc:
+    _DATABASE_INIT_ERROR = "The synthetic database could not be initialized."
+finally:
+    if _conn is not None:
+        _conn.close()
 
 
 # ==============================================================================
@@ -71,8 +77,14 @@ def check_gateway_health() -> Dict[str, Any]:
     Dynamically verify the health of the MediShield gateway and underlying database.
     Does not use hardcoded health values.
     """
-    target_db = ROOT_DIR / DEFAULT_DB_PATH
+    target_db = DATABASE_PATH
     try:
+        if _DATABASE_INIT_ERROR:
+            return {
+                "status": "OFFLINE",
+                "healthy": False,
+                "detail": _DATABASE_INIT_ERROR,
+            }
         if not target_db.exists():
             return {
                 "status": "DEGRADED",
@@ -80,13 +92,15 @@ def check_gateway_health() -> Dict[str, Any]:
                 "detail": f"Database file missing at {target_db.name}",
             }
         conn = get_connection(target_db)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN "
-            "('audit_events', 'approvals', 'actors', 'orders', 'tool_baseline')"
-        )
-        count = cursor.fetchone()[0]
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN "
+                "('audit_events', 'approvals', 'actors', 'orders', 'tool_baseline')"
+            )
+            count = cursor.fetchone()[0]
+        finally:
+            conn.close()
 
         if count < 5:
             return {
@@ -112,7 +126,7 @@ def check_gateway_health() -> Dict[str, Any]:
             return {
                 "status": "DEGRADED",
                 "healthy": False,
-                "detail": "Cryptographic engine self-test failed",
+                "detail": "Intent hash self-test failed",
             }
 
         return {
@@ -120,54 +134,59 @@ def check_gateway_health() -> Dict[str, Any]:
             "healthy": True,
             "detail": "All 5 core tables online • Fail-closed gateway ready • SHA-256 integrity check passed",
         }
-    except Exception as e:
+    except (OSError, sqlite3.Error, TypeError, ValueError):
         return {
             "status": "OFFLINE",
             "healthy": False,
-            "detail": f"Health check exception: {str(e)}",
+            "detail": "The gateway health check could not complete safely.",
         }
 
 
 def load_events(db_path: Optional[Path] = None) -> Tuple[List[Dict[str, Any]], str]:
     """
-    Load audit events from the SQLite audit_events table if rows exist;
-    otherwise fall back to reading logs/sample_events.jsonl.
+    Use SQLite audit events when the configured database exists. Sample events
+    are used only when that database file does not exist; an existing empty or
+    unavailable database is reported instead of being presented as live data.
     Always returns events sorted strictly descending by timestamp (newest first).
     """
     events: List[Dict[str, Any]] = []
-    target_db = Path(db_path) if db_path else (ROOT_DIR / DEFAULT_DB_PATH)
+    target_db = Path(db_path) if db_path else DATABASE_PATH
     source_type = "fallback"
 
     # 1. Try SQLite database
     try:
         if target_db.exists():
             conn = get_connection(target_db)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_events'")
-            if cursor.fetchone():
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_events'"
+                )
+                if cursor.fetchone() is None:
+                    return [], "Live Database schema incomplete"
+
                 cursor.execute("SELECT * FROM audit_events ORDER BY id DESC")
                 rows = cursor.fetchall()
-                if rows:
-                    source_type = "sqlite"
-                    for row in rows:
-                        raw_cf = row["changed_fields"]
-                        if isinstance(raw_cf, str):
-                            try:
-                                cf = json.loads(raw_cf)
-                            except Exception:
-                                cf = [f.strip() for f in raw_cf.split(",") if f.strip()]
-                        elif isinstance(raw_cf, list):
-                            cf = raw_cf
-                        else:
-                            cf = []
+                for row in rows:
+                    raw_cf = row["changed_fields"]
+                    if isinstance(raw_cf, str):
+                        try:
+                            cf = json.loads(raw_cf)
+                        except (TypeError, ValueError):
+                            cf = [f.strip() for f in raw_cf.split(",") if f.strip()]
+                    elif isinstance(raw_cf, list):
+                        cf = raw_cf
+                    else:
+                        cf = []
 
-                        actor = (
-                            row["actor_id"]
-                            if "actor_id" in row.keys()
-                            else row.get("actor", "unknown")
-                        )
+                    actor = (
+                        row["actor_id"]
+                        if "actor_id" in row.keys()
+                        else row.get("actor", "unknown")
+                    )
 
-                        event = {
+                    events.append(
+                        {
                             "time": str(row["time"]),
                             "request_id": str(row["request_id"]),
                             "actor": str(actor),
@@ -181,14 +200,16 @@ def load_events(db_path: Optional[Path] = None) -> Tuple[List[Dict[str, Any]], s
                             "changed_fields": cf,
                             "state_changed": bool(row["state_changed"]),
                         }
-                        events.append(event)
-                    conn.close()
-                    # Ensure strict descending order by time
-                    events.sort(key=lambda e: str(e.get("time") or ""), reverse=True)
-                    return events, "Live Database (SQLite: audit_events)"
-            conn.close()
-    except Exception:
-        pass
+                    )
+
+                # An existing, empty audit table is authoritative; do not
+                # replace it with sample events that look like live activity.
+                events.sort(key=lambda e: str(e.get("time") or ""), reverse=True)
+                return events, "Live Database (SQLite: audit_events)"
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        return [], "Live Database unavailable"
 
     # 2. Fallback to sample_events.jsonl
     jsonl_path = ROOT_DIR / "logs" / "sample_events.jsonl"
@@ -199,7 +220,7 @@ def load_events(db_path: Optional[Path] = None) -> Tuple[List[Dict[str, Any]], s
                 if line:
                     try:
                         events.append(json.loads(line))
-                    except Exception:
+                    except (TypeError, ValueError):
                         continue
         # Ensure strict descending order by time
         events.sort(key=lambda e: str(e.get("time") or ""), reverse=True)
@@ -396,7 +417,7 @@ st.sidebar.subheader("Security Invariants")
 st.sidebar.markdown(
     """
     - **Fail-Closed:** Default deny on any error
-    - **Intent Lock:** Deterministic SHA-256 HMAC
+    - **Intent Lock:** Deterministic SHA-256 action hash
     - **Canonicalized:** Decimal `dose` & lowercase `units`
     - **Single-Use:** Token consumed atomically
     - **Zero Trust:** Recomputed independently at gateway
@@ -676,13 +697,28 @@ with tab_test_lab:
     run_expired = col_btn4.button("⚡ Test 4: Expired Token", use_container_width=True)
     run_all = col_btn5.button("🚀 Run All Attack Tests", type="primary", use_container_width=True)
 
+    run_comparison = st.button("Compare guard-off vs guard-on")
+    if run_comparison:
+        try:
+            comparison = guard_off_vs_guard_on()
+            st.warning(
+                "Guard-off is intentionally vulnerable and isolated to temporary "
+                "synthetic data. It is not an execution path used by MediShield."
+            )
+            st.write("Guard-off result: the backend was changed without approval checks.")
+            st.json(comparison["guard_off"])
+            st.write("Guard-on result: the same tampered action went through the gateway.")
+            st.json(comparison["guard_on"])
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            st.error(f"The isolated comparison could not complete safely: {exc}")
+
     # 1. DOSE TAMPERING TEST
     if run_tamper or run_all:
         st.markdown("---")
         st.markdown("#### 🧪 Test 1: Protected Dose Tampering Attack")
         st.caption("Description: A clinician approved 5mg of MED-A, but an untrusted agent submits 50mg.")
 
-        conn = get_connection(ROOT_DIR / DEFAULT_DB_PATH)
+        conn = get_connection(DATABASE_PATH)
         approved_action = {
             "order_id": "ORD-DEMO-001",
             "patient_id": "P-104",
@@ -752,7 +788,7 @@ with tab_test_lab:
         st.markdown("#### 🧪 Test 2: Patient Substitution Attack")
         st.caption("Description: A clinician approved an order for Patient P-104; an agent attempts to apply it to P-205.")
 
-        conn = get_connection(ROOT_DIR / DEFAULT_DB_PATH)
+        conn = get_connection(DATABASE_PATH)
         approved_action = {
             "order_id": "ORD-DEMO-001",
             "patient_id": "P-104",
@@ -811,7 +847,7 @@ with tab_test_lab:
         st.markdown("#### 🧪 Test 3: Approval Replay Attack")
         st.caption("Description: A legitimate approval is executed once, then replayed a second time using the consumed token.")
 
-        conn = get_connection(ROOT_DIR / DEFAULT_DB_PATH)
+        conn = get_connection(DATABASE_PATH)
         action_data = {
             "order_id": "ORD-DEMO-001",
             "patient_id": "P-104",
@@ -880,7 +916,7 @@ with tab_test_lab:
         st.markdown("#### 🧪 Test 4: Expired Clinician Approval Attack")
         st.caption("Description: Agent attempts to execute an action using an approval token whose validity period has elapsed.")
 
-        conn = get_connection(ROOT_DIR / DEFAULT_DB_PATH)
+        conn = get_connection(DATABASE_PATH)
         action_data = {
             "order_id": "ORD-DEMO-001",
             "patient_id": "P-104",
@@ -1045,32 +1081,32 @@ with tab_verification:
 
     with verif_col1:
         st.markdown("#### 📋 Clinician Approved Action")
-        app_patient = st.text_input("Approved Patient ID", value=st.session_state.get("v_app_patient", base_patient), key="v_app_patient")
-        app_med = st.text_input("Approved Medication ID", value=st.session_state.get("v_app_med", base_med), key="v_app_med")
-        app_dose = st.text_input("Approved Dose", value=st.session_state.get("v_app_dose", base_dose), key="v_app_dose")
-        app_units = st.text_input("Approved Units", value=st.session_state.get("v_app_units", base_units), key="v_app_units")
-        app_route = st.text_input("Approved Route", value=st.session_state.get("v_app_route", base_route), key="v_app_route")
-        app_freq = st.text_input("Approved Frequency", value=st.session_state.get("v_app_freq", base_freq), key="v_app_freq")
-        app_dur = st.text_input("Approved Duration", value=st.session_state.get("v_app_dur", base_dur), key="v_app_dur")
-        app_order = st.text_input("Approved Order ID", value=st.session_state.get("v_app_order", base_order), key="v_app_order")
+        app_patient = st.text_input("Approved Patient ID", key="v_app_patient")
+        app_med = st.text_input("Approved Medication ID", key="v_app_med")
+        app_dose = st.text_input("Approved Dose", key="v_app_dose")
+        app_units = st.text_input("Approved Units", key="v_app_units")
+        app_route = st.text_input("Approved Route", key="v_app_route")
+        app_freq = st.text_input("Approved Frequency", key="v_app_freq")
+        app_dur = st.text_input("Approved Duration", key="v_app_dur")
+        app_order = st.text_input("Approved Order ID", key="v_app_order")
 
     with verif_col2:
         st.markdown("#### 🤖 Agent Submitted Action")
-        sub_patient = st.text_input("Submitted Patient ID", value=st.session_state.get("v_sub_patient", base_patient), key="v_sub_patient")
-        sub_med = st.text_input("Submitted Medication ID", value=st.session_state.get("v_sub_med", base_med), key="v_sub_med")
-        sub_dose = st.text_input("Submitted Dose", value=st.session_state.get("v_sub_dose", base_dose), key="v_sub_dose")
-        sub_units = st.text_input("Submitted Units", value=st.session_state.get("v_sub_units", base_units), key="v_sub_units")
-        sub_route = st.text_input("Submitted Route", value=st.session_state.get("v_sub_route", base_route), key="v_sub_route")
-        sub_freq = st.text_input("Submitted Frequency", value=st.session_state.get("v_sub_freq", base_freq), key="v_sub_freq")
-        sub_dur = st.text_input("Submitted Duration", value=st.session_state.get("v_sub_dur", base_dur), key="v_sub_dur")
-        sub_order = st.text_input("Submitted Order ID", value=st.session_state.get("v_sub_order", base_order), key="v_sub_order")
+        sub_patient = st.text_input("Submitted Patient ID", key="v_sub_patient")
+        sub_med = st.text_input("Submitted Medication ID", key="v_sub_med")
+        sub_dose = st.text_input("Submitted Dose", key="v_sub_dose")
+        sub_units = st.text_input("Submitted Units", key="v_sub_units")
+        sub_route = st.text_input("Submitted Route", key="v_sub_route")
+        sub_freq = st.text_input("Submitted Frequency", key="v_sub_freq")
+        sub_dur = st.text_input("Submitted Duration", key="v_sub_dur")
+        sub_order = st.text_input("Submitted Order ID", key="v_sub_order")
 
     st.markdown("")
     run_check = st.button("🔒 Run Gateway Intent Lock Check", type="primary", use_container_width=True)
 
 
 
-    if gw_health["healthy"] and (run_check or "last_loaded_preset" in st.session_state):
+    if gw_health["healthy"] and run_check:
         def clean_val(v, default=""):
             s = str(v).strip() if v is not None else ""
             return s if s else default
@@ -1111,7 +1147,7 @@ with tab_verification:
                             return "✅ Exact Match"
                         return f"✅ Exact Match (Normalized: {a_str} = {s_str})"
                     return "❌ Tampered / Mismatch"
-                except Exception:
+                except (ArithmeticError, TypeError, ValueError):
                     return "❌ Invalid Decimal Dose Syntax"
 
             # Units normalization
@@ -1149,8 +1185,9 @@ with tab_verification:
             })
 
         # Run through actual gateway verification engine safely
+        conn = None
         try:
-            conn = get_connection(ROOT_DIR / DEFAULT_DB_PATH)
+            conn = get_connection(DATABASE_PATH)
             app_id = "APR-ACTION-VERIF"
             _setup_test_approval(conn, app_id, approved_dict)
 
@@ -1162,7 +1199,6 @@ with tab_verification:
                 action=ProtectedAction(**submitted_dict),
             )
             decision = verify_execution(exec_req, conn, destination=PINNED_DESTINATIONS["update_order"])
-            conn.close()
 
             # Canonical strings and hashes
             app_canon = canonicalize_action(approved_dict)
@@ -1229,15 +1265,18 @@ with tab_verification:
                 st.code(f"Submitted Action Hash:\n{sub_h}", language="text")
 
             if app_h == sub_h:
-                st.caption("🔒 **Cryptographic Match:** The submitted digest is identical to the clinician's signature.")
+                st.caption("🔒 **Cryptographic Match:** The submitted digest matches the approved action hash.")
             else:
                 st.caption("🚨 **Digest Mismatch:** The submitted action cannot produce the approved hash.")
 
             with st.expander("🔍 Inspect Canonical Compact JSON", expanded=False):
                 st.code(f"Approved Canonical JSON:\n{app_canon}\n\nSubmitted Canonical JSON:\n{sub_canon}", language="json")
 
-        except Exception as ex:
-            st.error(f"🔴 Validation Exception: {str(ex)}")
+        except (OSError, sqlite3.Error, TypeError, ValueError) as ex:
+            st.error(f"🔴 Verification could not complete safely: {str(ex)}")
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 # ------------------------------------------------------------------------------

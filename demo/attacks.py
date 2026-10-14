@@ -1,23 +1,25 @@
 """Executable adversarial scenarios for the synthetic MediShield demo.
 
-Each public function creates its own temporary SQLite database.  The gateway
-currently remains a scaffold, so these scenarios intentionally become
-executable once the guard implementation can read the documented database
-state from its working directory.
+Each public function creates its own temporary SQLite database. The protected
+scenarios exercise the real gateway; the guard-off comparison is explicitly
+isolated and intentionally vulnerable for synthetic demonstration only.
 """
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from typing import Any, Iterator
+from unittest.mock import patch
 
+from guard import audit
 from guard import gateway
 from guard.intent import action_hash, canonicalize_action
 from guard.models import ExecutionRequest, ProtectedAction
+from server import backend
 from server.db import initialize_db
 
 
@@ -72,7 +74,7 @@ def _request(
 def _pin_tool(connection: Any) -> None:
     connection.execute(
         """
-        INSERT INTO tool_baseline(tool_name, fingerprint, allowed_destination)
+        INSERT OR IGNORE INTO tool_baseline(tool_name, fingerprint, allowed_destination)
         VALUES (?, ?, ?)
         """,
         (_TOOL_NAME, _PINNED_FINGERPRINT, _PINNED_DESTINATION),
@@ -115,18 +117,16 @@ def _create_approval(
 
 @contextmanager
 def _temporary_database() -> Iterator[Any]:
-    """Create a seeded database where the future gateway finds its default DB."""
+    """Create an isolated seeded database and isolated audit log."""
 
     with TemporaryDirectory() as directory:
-        original_directory = Path.cwd()
-        os.chdir(directory)
-        connection = initialize_db(_DATABASE_NAME)
-        try:
-            _pin_tool(connection)
-            yield connection
-        finally:
-            connection.close()
-            os.chdir(original_directory)
+        connection = initialize_db(Path(directory) / _DATABASE_NAME)
+        with patch.object(audit, "LOG_PATH", Path(directory) / "events.jsonl"):
+            try:
+                _pin_tool(connection)
+                yield connection
+            finally:
+                connection.close()
 
 
 def _backend_state(connection: Any) -> dict[str, list[dict[str, Any]]]:
@@ -180,7 +180,9 @@ def tamper_dose() -> dict[str, Any]:
         )
         request = _request(submitted_action, approval_id, "REQ-TAMPER-DOSE")
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result("tamper_dose", approved_action, request, decision, before, after)
 
@@ -200,7 +202,9 @@ def substitute_patient() -> dict[str, Any]:
             submitted_action, approval_id, "REQ-PATIENT-SUBSTITUTION"
         )
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result(
             "substitute_patient", approved_action, request, decision, before, after
@@ -220,7 +224,9 @@ def unauthorized_actor() -> dict[str, Any]:
             actor_id="nurse_1",
         )
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result(
             "unauthorized_actor", approved_action, request, decision, before, after
@@ -234,11 +240,15 @@ def replay_consumed_approval() -> dict[str, Any]:
         approval_id = "APR-REPLAY"
         _create_approval(connection, approved_action, approval_id)
         first_request = _request(approved_action, approval_id, "REQ-REPLAY-FIRST")
-        gateway.verify_execution(first_request)
+        gateway.verify_execution(
+            first_request, connection, destination=_PINNED_DESTINATION
+        )
 
         replay_request = _request(approved_action, approval_id, "REQ-REPLAY-SECOND")
         before = _backend_state(connection)
-        decision = gateway.verify_execution(replay_request)
+        decision = gateway.verify_execution(
+            replay_request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result(
             "replay_consumed_approval",
@@ -267,7 +277,9 @@ def changed_destination() -> dict[str, Any]:
         connection.commit()
         request = _request(approved_action, approval_id, "REQ-CHANGED-DESTINATION")
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result(
             "changed_destination", approved_action, request, decision, before, after
@@ -296,7 +308,9 @@ def prompt_injection_note() -> dict[str, Any]:
         connection.commit()
         request = _request(approved_action, approval_id, "REQ-PROMPT-INJECTION")
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result(
             "prompt_injection_note", approved_action, request, decision, before, after
@@ -316,7 +330,9 @@ def expired_approval() -> dict[str, Any]:
         )
         request = _request(approved_action, approval_id, "REQ-EXPIRED")
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result(
             "expired_approval", approved_action, request, decision, before, after
@@ -331,7 +347,9 @@ def revoked_approval() -> dict[str, Any]:
         _create_approval(connection, approved_action, approval_id, revoked=True)
         request = _request(approved_action, approval_id, "REQ-REVOKED")
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result(
             "revoked_approval", approved_action, request, decision, before, after
@@ -346,6 +364,69 @@ def valid_action() -> dict[str, Any]:
         _create_approval(connection, approved_action, approval_id)
         request = _request(approved_action, approval_id, "REQ-VALID")
         before = _backend_state(connection)
-        decision = gateway.verify_execution(request)
+        decision = gateway.verify_execution(
+            request, connection, destination=_PINNED_DESTINATION
+        )
         after = _backend_state(connection)
         return _result("valid_action", approved_action, request, decision, before, after)
+
+
+def guard_off_vs_guard_on() -> dict[str, Any]:
+    """Compare an isolated vulnerable backend call with the protected gateway.
+
+    The guard-off path is intentionally vulnerable and exists only for this
+    synthetic hackathon comparison. It bypasses approval and gateway checks,
+    uses a separate temporary database, and is never used by MCP or the
+    dashboard's protected execution path.
+    """
+
+    with _temporary_database() as baseline_connection:
+        with _temporary_database() as protected_connection:
+            approved_action = _approved_action()
+            tampered_action = (
+                approved_action.model_copy(update={"dose": "50"})
+                if hasattr(approved_action, "model_copy")
+                else approved_action.copy(update={"dose": "50"})
+            )
+
+            baseline_before = _backend_state(baseline_connection)
+            # Intentionally bypass the gateway in the isolated vulnerable path.
+            backend.execute(
+                SimpleNamespace(action=tampered_action),
+                connection=baseline_connection,
+            )
+            baseline_connection.commit()
+            baseline_after = _backend_state(baseline_connection)
+
+            approval_id = "APR-GUARD-COMPARISON"
+            _create_approval(protected_connection, approved_action, approval_id)
+            protected_before = _backend_state(protected_connection)
+            protected_request = _request(
+                tampered_action,
+                approval_id,
+                "REQ-GUARD-COMPARISON",
+            )
+            protected_decision = gateway.verify_execution(
+                protected_request,
+                protected_connection,
+                destination=_PINNED_DESTINATION,
+            )
+            protected_after = _backend_state(protected_connection)
+
+            return {
+                "approved_action": _model_dict(approved_action),
+                "tampered_action": _model_dict(tampered_action),
+                "guard_off": {
+                    "decision": "bypassed",
+                    "state_changed": baseline_before != baseline_after,
+                    "backend_state_before": baseline_before,
+                    "backend_state_after": baseline_after,
+                },
+                "guard_on": {
+                    "decision": protected_decision.decision,
+                    "rule": protected_decision.rule,
+                    "state_changed": protected_decision.state_changed,
+                    "backend_state_before": protected_before,
+                    "backend_state_after": protected_after,
+                },
+            }

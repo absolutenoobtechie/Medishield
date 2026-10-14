@@ -99,6 +99,28 @@ def test_apply_order_uses_caller_transaction(isolated_database):
     connection.close()
 
 
+def test_reinitializing_database_does_not_reset_existing_order(tmp_path):
+    database_path = tmp_path / "medishield.sqlite3"
+    connection = initialize_db(database_path)
+    connection.execute(
+        "UPDATE orders SET dose = ? WHERE order_id = ?",
+        ("7", "ORD-DEMO-001"),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = initialize_db(database_path)
+    try:
+        dose = reopened.execute(
+            "SELECT dose FROM orders WHERE order_id = ?",
+            ("ORD-DEMO-001",),
+        ).fetchone()[0]
+    finally:
+        reopened.close()
+
+    assert dose == "7"
+
+
 def test_write_event_stores_database_and_matching_jsonl(isolated_database):
     database_path, log_path = isolated_database
     event = {

@@ -47,7 +47,7 @@ def _validated_values(action: ProtectedAction | Mapping[str, Any]) -> dict[str, 
         if set(values) != set(_PROTECTED_FIELDS):
             raise ValueError("protected action fields do not match the contract")
         return values
-    except Exception as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError("protected action is invalid") from exc
 
 
@@ -93,6 +93,21 @@ def canonicalize_action(action: ProtectedAction | Mapping[str, Any]) -> str:
     """Return sorted, compact JSON for the authoritative action fields only."""
 
     values = _validated_values(action)
+    text_fields = (
+        "patient_id",
+        "medication_id",
+        "units",
+        "route",
+        "frequency",
+        "order_id",
+    )
+    for field in text_fields:
+        if not isinstance(values[field], str) or not values[field].strip():
+            raise ValueError(f"{field} must be a non-empty string")
+    if values["duration"] is not None and (
+        not isinstance(values["duration"], str) or not values["duration"].strip()
+    ):
+        raise ValueError("duration must be null or a non-empty string")
     canonical = {field: values[field] for field in _PROTECTED_FIELDS}
     canonical["dose"] = _normalize_dose(canonical["dose"])
     canonical["units"] = canonical["units"].lower()

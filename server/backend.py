@@ -47,6 +47,8 @@ def _as_action(action: ProtectedAction | dict) -> ProtectedAction:
     if isinstance(action, ProtectedAction):
         return action
     if isinstance(action, dict):
+        if hasattr(ProtectedAction, "model_validate"):
+            return ProtectedAction.model_validate(action)
         return ProtectedAction.parse_obj(action)
     raise TypeError("action must be a ProtectedAction or a dictionary")
 
@@ -238,7 +240,7 @@ def execute(
     order mutation, and audit persistence can commit or roll back together.
     """
     close_after = connection is None
-    current = connection if connection is not None else get_connection(DEFAULT_DB_PATH)
+    current = connection if connection is not None else get_connection(DATABASE_PATH)
     try:
         if not hasattr(request, "action"):
             raise TypeError("request must expose a validated action")

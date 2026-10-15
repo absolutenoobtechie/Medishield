@@ -16,12 +16,16 @@ from typing import Any, Iterator
 from unittest.mock import patch
 
 from guard import audit
+from guard.approval import compute_approval_mac
 from guard import gateway
 from guard import sentinel
 from guard.intent import action_hash, canonicalize_action
 from guard.models import ExecutionRequest, ProtectedAction
-from server import backend
+from server import backend, mcp_server
+from server.backend import _GATEWAY_EXECUTION_TOKEN
 from server.db import initialize_db
+from privacy.auth import authenticate_local
+from privacy.vault import review_document, retrieve_document, upload_document, verify_document_integrity
 
 
 _DATABASE_NAME = "medishield.sqlite3"
@@ -95,22 +99,34 @@ def _create_approval(
 
     now = datetime.now(timezone.utc)
     expires_at = expires_at or now + timedelta(minutes=5)
+    action_json = canonicalize_action(action)
+    action_digest = action_hash(action)
+    created_at_text = now.isoformat()
+    expires_at_text = expires_at.isoformat()
     connection.execute(
         """
         INSERT INTO approvals(
             approval_id, action_hash, action_json, approver_id, created_at,
-            expires_at, revoked, consumed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            expires_at, revoked, consumed, approval_mac
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             approval_id,
-            action_hash(action),
-            canonicalize_action(action),
+            action_digest,
+            action_json,
             "clinician_1",
-            now.isoformat(),
-            expires_at.isoformat(),
+            created_at_text,
+            expires_at_text,
             int(revoked),
             0,
+            compute_approval_mac(
+                approval_id=approval_id,
+                action_json=action_json,
+                action_hash=action_digest,
+                approver_id="clinician_1",
+                created_at=created_at_text,
+                expires_at=expires_at_text,
+            ),
         ),
     )
     connection.commit()
@@ -392,7 +408,11 @@ def guard_off_vs_guard_on() -> dict[str, Any]:
 
             baseline_before = _backend_state(baseline_connection)
             # Intentionally bypass the gateway in the isolated vulnerable path.
-            backend.apply_order(tampered_action, connection=baseline_connection)
+            backend.apply_order(
+                tampered_action,
+                connection=baseline_connection,
+                _gateway_token=_GATEWAY_EXECUTION_TOKEN,
+            )
             baseline_connection.commit()
             baseline_after = _backend_state(baseline_connection)
 
@@ -430,7 +450,10 @@ def guard_off_vs_guard_on() -> dict[str, Any]:
             }
 
 
-def tool_registry_tampering() -> dict[str, Any]:
+def tool_registry_tampering(
+    tamper_mode: str = "unexpected_tool",
+    patient_id: str = "P-104",
+) -> dict[str, Any]:
     """Demonstrate declared-tool drift blocking a real gateway execution.
 
     The altered registry is an in-memory fixture. No injected function is
@@ -442,19 +465,36 @@ def tool_registry_tampering() -> dict[str, Any]:
             sentinel.EXPECTED_TOOL_REGISTRY
         )
         simulated_registry = list(copy.deepcopy(sentinel.EXPECTED_TOOL_REGISTRY))
-        simulated_registry.append(
-            {
-                "name": "unexpected_tool",
-                "title": None,
-                "description": "Synthetic unexpected tool.",
-                "inputSchema": {"type": "object"},
-                "outputSchema": {"additionalProperties": True, "type": "object"},
-                "annotations": None,
-                "icons": None,
-                "meta": None,
+        tamper_descriptions = {
+            "rename_tool": "Renamed the protected patient-record tool in the isolated registry.",
+            "unexpected_tool": "Injected one unexpected synthetic tool into the isolated registry.",
+            "schema_drift": "Changed the declared input schema of a protected tool.",
+        }
+        if tamper_mode == "rename_tool":
+            simulated_registry[0]["name"] = "get_patient_record_tampered"
+        elif tamper_mode == "schema_drift":
+            simulated_registry[1]["inputSchema"] = {
+                **simulated_registry[1]["inputSchema"],
+                "additionalProperties": True,
             }
-        )
+        elif tamper_mode == "unexpected_tool":
+            simulated_registry.append(
+                {
+                    "name": "unexpected_tool",
+                    "title": None,
+                    "description": "Synthetic unexpected tool.",
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {"additionalProperties": True, "type": "object"},
+                    "annotations": None,
+                    "icons": None,
+                    "meta": None,
+                }
+            )
+        else:
+            raise ValueError("tamper_mode must be rename_tool, unexpected_tool, or schema_drift")
         simulated_result = sentinel.check_registry(simulated_registry)
+
+        db_path = Path(connection.execute("PRAGMA database_list").fetchone()[2])
 
         approved_action = _approved_action()
         approval_id = "APR-TOOL-REGISTRY-TAMPER"
@@ -493,6 +533,39 @@ def tool_registry_tampering() -> dict[str, Any]:
             "REQ-TOOL-REGISTRY-TAMPER", connection=connection
         )
 
+        # Exercise the patient-record path through the dispatcher, not a
+        # presentation-only warning. The isolated override is checked before
+        # the protected handler and cannot alter the trusted source baseline.
+        patient_handler_calls = 0
+        original_patient_handler = backend.get_patient_record
+
+        def _spy_patient_handler(*args, **kwargs):
+            nonlocal patient_handler_calls
+            patient_handler_calls += 1
+            return original_patient_handler(*args, **kwargs)
+
+        with patch.object(mcp_server, "DATABASE_PATH", db_path), patch.object(
+            backend, "get_patient_record", side_effect=_spy_patient_handler
+        ):
+            patient_blocked = mcp_server.dispatch_mcp_tool_call(
+                tool_name="get_patient_record",
+                arguments={"patient_id": patient_id},
+                actor_id="clinician_1",
+                request_id="REQ-PATIENT-REGISTRY-TAMPER",
+                registry_override=simulated_registry,
+                connection=connection,
+            )
+            connection.commit()
+            blocked_patient_handler_calls = patient_handler_calls
+            patient_allowed = mcp_server.dispatch_mcp_tool_call(
+                tool_name="get_patient_record",
+                arguments={"patient_id": patient_id},
+                actor_id="clinician_1",
+                request_id="REQ-PATIENT-REGISTRY-RESTORED",
+                registry_override=sentinel.EXPECTED_TOOL_REGISTRY,
+                connection=connection,
+            )
+
         restored_result = sentinel.check_registry()
         allowed = gateway.verify_execution(
             request, connection, destination=_PINNED_DESTINATION
@@ -527,4 +600,90 @@ def tool_registry_tampering() -> dict[str, Any]:
                 "backend_state_after": state_after_restore,
                 "approval_consumed": bool(approval_after_restore),
             },
+            "stage1_baseline": {
+                "status": "trusted",
+                "expected_fingerprint": expected_fingerprint,
+            },
+            "stage2_tampered_registry": simulated_registry,
+            "stage3_detection": simulated_result.to_dict(),
+            "stage4_dispatch_result": patient_blocked,
+            "stage5_observable_proof": {
+                "handler_invoked": blocked_patient_handler_calls > 0,
+                "patient_record_returned": patient_blocked.get("data") is not None,
+                "state_changed": patient_blocked.get("state_changed", False),
+                "handler_calls": blocked_patient_handler_calls,
+            },
+            "stage6_evidence": {
+                "tamper_mode": tamper_mode,
+                "tamper_description": tamper_descriptions[tamper_mode],
+            },
+            "stage7_restoration": sentinel.check_registry().to_dict(),
+            "stage8_authorized_resumption": patient_allowed,
         }
+
+
+def document_vault_workflow() -> dict[str, Any]:
+    """Run the real synthetic upload, review, retrieval, and tamper checks."""
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        with patch.object(audit, "LOG_PATH", root / "events.jsonl"):
+            connection = initialize_db(root / "medishield.sqlite3")
+            try:
+                uploader = authenticate_local(connection, "clinician_1", "ORG-DEMO")
+                reviewer = authenticate_local(connection, "privacy_1", "ORG-DEMO")
+                researcher = authenticate_local(connection, "researcher_1", "ORG-DEMO")
+                content = (
+                    b"Patient Name: Synthetic Patient Alpha\n"
+                    b"DOB: 01/02/1980\n"
+                    b"MRN: MRN-DEMO-001\n"
+                    b"Assessment: synthetic follow-up; continue metformin."
+                )
+                uploaded = upload_document(
+                    connection,
+                    uploader,
+                    "synthetic-note.txt",
+                    content,
+                    storage_root=root / "vault",
+                )
+                approved = review_document(
+                    connection,
+                    reviewer,
+                    uploaded["document_id"],
+                    "approve",
+                    storage_root=root / "vault",
+                )
+                derivative = retrieve_document(
+                    connection,
+                    researcher,
+                    uploaded["document_id"],
+                    storage_root=root / "vault",
+                )
+                row = connection.execute(
+                    "SELECT derivative_path FROM documents WHERE document_id = ?",
+                    (uploaded["document_id"],),
+                ).fetchone()
+                derivative_path = root / "vault" / row[0]
+                tampered = bytearray(derivative_path.read_bytes())
+                tampered[-1] ^= 1
+                derivative_path.write_bytes(tampered)
+                integrity = verify_document_integrity(
+                    connection,
+                    authenticate_local(connection, "auditor_1", "ORG-DEMO"),
+                    uploaded["document_id"],
+                    storage_root=root / "vault",
+                )
+                return {
+                    "uploaded": {
+                        "document_id": uploaded["document_id"],
+                        "status": uploaded["status"],
+                        "report": uploaded["report"],
+                    },
+                    "approved_status": approved["status"],
+                    "derivative_contains_raw_name": b"Synthetic Patient Alpha" in derivative,
+                    "derivative_contains_clinical_text": b"metformin" in derivative,
+                    "tamper_detected": integrity["valid"] is False,
+                    "integrity": integrity,
+                }
+            finally:
+                connection.close()

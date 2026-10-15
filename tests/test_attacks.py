@@ -11,6 +11,7 @@ from demo.attacks import (
     revoked_approval,
     substitute_patient,
     tamper_dose,
+    tool_registry_tampering,
     unauthorized_actor,
     valid_action,
 )
@@ -71,3 +72,25 @@ def test_guard_off_comparison_uses_real_backend_and_gateway():
     assert result["guard_on"]["rule"] == "intent hash mismatch"
     assert result["guard_on"]["state_changed"] is False
     assert result["guard_on"]["backend_state_before"] == result["guard_on"]["backend_state_after"]
+
+
+def test_tool_registry_tampering_is_detected_and_restored():
+    result = tool_registry_tampering()
+
+    assert result["simulated_registry"]["status"] == "drift"
+    assert "unexpected tool: unexpected_tool" in result["simulated_registry"]["differences"]
+    assert result["blocked"]["decision"] == "blocked"
+    assert result["blocked"]["rule"] == "tool registry drift"
+    assert result["blocked"]["state_changed"] is False
+    assert result["blocked"]["approval_consumed"] is False
+    assert result["blocked"]["handler_invoked"] is False
+    assert result["blocked"]["handler_calls"] == 0
+    assert result["blocked"]["evidence"] is not None
+    assert result["blocked"]["evidence"]["failed_check"] == "tool registry drift"
+    assert result["blocked"]["evidence"]["is_simulation"] is True
+    assert result["blocked"]["backend_state_before"] == result["blocked"]["backend_state_after"]
+    assert result["expected_fingerprint_before"] == result["expected_fingerprint_after"]
+    assert result["restored"]["registry"]["status"] == "trusted"
+    assert result["restored"]["decision"] == "allowed"
+    assert result["restored"]["state_changed"] is True
+    assert result["restored"]["approval_consumed"] is True

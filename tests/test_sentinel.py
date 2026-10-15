@@ -1,16 +1,17 @@
 """Focused tests for MCP registry integrity and forensic evidence."""
 
 import copy
-import json
 import sqlite3
+import json
 
 import pytest
 
 from guard import sentinel
+from guard.approval import compute_approval_mac
 from guard.forensics import evidence_for_request
 from guard.gateway import verify_execution
 from guard.models import ExecutionRequest, ProtectedAction
-from guard.intent import action_hash
+from guard.intent import action_hash, canonicalize_action
 from guard.policy import PINNED_DESTINATIONS
 from server.db import init_db, seed_data
 
@@ -37,20 +38,32 @@ def _action() -> ProtectedAction:
 
 def _approval(connection, approval_id="APR-SENTINEL-001"):
     action = _action()
+    action_json = canonicalize_action(action)
+    action_digest = action_hash(action)
+    created_at = "2026-10-14T00:00:00Z"
+    expires_at = "2026-10-15T00:00:00Z"
     connection.execute(
         """
         INSERT INTO approvals(
             approval_id, action_hash, action_json, approver_id,
-            created_at, expires_at, revoked, consumed
-        ) VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+            created_at, expires_at, revoked, consumed, approval_mac
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
         """,
         (
             approval_id,
-            action_hash(action),
-            json.dumps(action.model_dump()),
+            action_digest,
+            action_json,
             "clinician_1",
-            "2026-10-14T00:00:00Z",
-            "2026-10-15T00:00:00Z",
+            created_at,
+            expires_at,
+            compute_approval_mac(
+                approval_id=approval_id,
+                action_json=action_json,
+                action_hash=action_digest,
+                approver_id="clinician_1",
+                created_at=created_at,
+                expires_at=expires_at,
+            ),
         ),
     )
     connection.commit()

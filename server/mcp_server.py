@@ -22,6 +22,19 @@ from server.db import DEFAULT_DB_PATH, get_connection, init_db
 
 DATABASE_PATH = DEFAULT_DB_PATH
 UPDATE_ORDER_TOOL = "update_order"
+_MAX_PATIENT_RESPONSE_BYTES = 64 * 1024
+_MAX_PATIENT_ORDERS = 256
+_PATIENT_FIELDS = {"patient_id", "name_synthetic", "org_id"}
+_ORDER_FIELDS = {
+    "order_id",
+    "patient_id",
+    "medication_id",
+    "dose",
+    "units",
+    "route",
+    "frequency",
+    "duration",
+}
 
 mcp = FastMCP("MediShield")
 
@@ -123,6 +136,108 @@ def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Convert one configured SQLite row to a JSON-ready dictionary."""
 
     return {key: row[key] for key in row.keys()}
+
+
+class ResponseGuardError(ValueError):
+    """Raised when a protected tool response is unsafe to release."""
+
+
+def _validate_patient_response(
+    response: Any,
+    *,
+    patient_id: str,
+    org_id: str,
+) -> dict[str, Any]:
+    """Validate and minimize one patient response before returning it to MCP.
+
+    The backend is trusted to query SQLite, but its returned object is still
+    treated as untrusted tool output at the MCP boundary. Internal tenant
+    metadata is checked and then omitted from the released patient object.
+    Unknown fields, cross-tenant identifiers, malformed values, and oversized
+    responses fail closed instead of reaching the agent.
+    """
+
+    if not isinstance(response, dict) or set(response) != {"patient", "orders"}:
+        raise ResponseGuardError("patient response structure is invalid")
+    patient = response["patient"]
+    orders = response["orders"]
+    if not isinstance(patient, dict) or not isinstance(orders, list):
+        raise ResponseGuardError("patient response types are invalid")
+    if set(patient) - _PATIENT_FIELDS:
+        raise ResponseGuardError("patient response contains unexpected fields")
+    if patient.get("patient_id") != patient_id:
+        raise ResponseGuardError("patient response identifier does not match the request")
+    if not isinstance(patient.get("name_synthetic"), str) or not patient["name_synthetic"]:
+        raise ResponseGuardError("patient response name is invalid")
+    if patient.get("org_id") != org_id:
+        raise ResponseGuardError("patient response tenant scope is invalid")
+    if len(orders) > _MAX_PATIENT_ORDERS:
+        raise ResponseGuardError("patient response exceeds the order limit")
+
+    safe_orders: list[dict[str, Any]] = []
+    for order in orders:
+        if not isinstance(order, dict) or set(order) != _ORDER_FIELDS:
+            raise ResponseGuardError("patient response order structure is invalid")
+        if order.get("patient_id") != patient_id:
+            raise ResponseGuardError("patient response order scope is invalid")
+        for field, value in order.items():
+            if field == "duration":
+                if value is not None and not isinstance(value, str):
+                    raise ResponseGuardError("patient response order value is invalid")
+            elif not isinstance(value, str) or not value:
+                raise ResponseGuardError("patient response order value is invalid")
+        safe_orders.append(dict(order))
+
+    safe_response = {
+        "patient": {
+            "patient_id": patient_id,
+            "name_synthetic": patient["name_synthetic"],
+        },
+        "orders": safe_orders,
+    }
+    try:
+        encoded = json.dumps(
+            safe_response,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ResponseGuardError("patient response is not JSON-safe") from exc
+    if len(encoded) > _MAX_PATIENT_RESPONSE_BYTES:
+        raise ResponseGuardError("patient response exceeds the size limit")
+    return safe_response
+
+
+def _audit_response_block(
+    connection: sqlite3.Connection,
+    *,
+    request_id: str,
+    actor_id: str,
+    reason: str,
+) -> None:
+    """Record a blocked response release, or fail closed if auditing fails."""
+
+    from guard.audit import record_audit_event
+
+    record_audit_event(
+        {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "actor": actor_id,
+            "tool": "get_patient_record",
+            "action_type": "get_patient_record_response",
+            "approval_id": None,
+            "decision": "blocked",
+            "risk": "high",
+            "rule": "response validation failed",
+            "reason": reason,
+            "changed_fields": [],
+            "state_changed": False,
+        },
+        connection=connection,
+    )
+    connection.commit()
 
 
 def get_tool_integrity_status() -> dict[str, Any]:
@@ -268,12 +383,34 @@ def get_patient_record(patient_id: str) -> dict[str, Any]:
             )
             raise PermissionError("Access denied: patient-record authorization failed.")
 
+        request_id = f"REQ-PATIENT-{uuid.uuid4().hex}"
         patient = backend.get_patient_record(
             patient_id,
             connection=connection,
             trusted_user=user,
         )
-        request_id = f"REQ-PATIENT-{uuid.uuid4().hex}"
+        try:
+            safe_patient = _validate_patient_response(
+                patient,
+                patient_id=patient_id,
+                org_id=user.org_id,
+            )
+        except ResponseGuardError as exc:
+            try:
+                _audit_response_block(
+                    connection,
+                    request_id=request_id,
+                    actor_id=user.actor_id,
+                    reason=str(exc),
+                )
+            except (sqlite3.Error, OSError, TypeError, ValueError):
+                connection.rollback()
+                raise PermissionError(
+                    "Access denied: the response security event could not be recorded."
+                ) from None
+            raise PermissionError(
+                "Access denied: the patient response failed security validation."
+            ) from None
         record_audit_event(
             {
                 "time": datetime.now(timezone.utc).isoformat(),
@@ -292,7 +429,7 @@ def get_patient_record(patient_id: str) -> dict[str, Any]:
             connection=connection,
         )
         connection.commit()
-        return patient
+        return safe_patient
     except PermissionError:
         raise
     except (sqlite3.Error, OSError, TypeError, ValueError):
@@ -466,7 +603,12 @@ def get_security_events(limit: int = 20) -> list[dict[str, Any]]:
         connection.close()
 
 
-from guard.sentinel import RegistryVerificationResult, get_trusted_baseline_tools, verify_registry
+from guard.sentinel import (
+    RegistryVerificationResult,
+    check_registry,
+    get_trusted_baseline_tools,
+    verify_registry,
+)
 
 _active_registry: list[dict[str, Any]] = get_trusted_baseline_tools()
 
@@ -498,8 +640,14 @@ def dispatch_mcp_tool_call(
     ts = datetime.now(timezone.utc).isoformat()
     req_id = request_id or f"REQ-MCP-{int(datetime.now().timestamp() * 1000)}"
 
-    target_registry = registry_override if registry_override is not None else _active_registry
-    sentinel_result: RegistryVerificationResult = verify_registry(target_registry)
+    if registry_override is None:
+        # Normal dispatch must inspect the live FastMCP registry. The mutable
+        # active-registry snapshot is retained only for the isolated demo UI.
+        sentinel_result: RegistryVerificationResult = check_registry()
+    else:
+        # The override is dependency injection for the synthetic tampering
+        # demonstration, not a normal-operation trust source.
+        sentinel_result = verify_registry(registry_override)
 
     close_after = False
     if connection is None:

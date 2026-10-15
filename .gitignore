@@ -5,4 +5,5 @@ __pycache__/
 *.sqlite3
 .pytest_cache/
 logs/events.jsonl
+.medishield_vault/
 work/

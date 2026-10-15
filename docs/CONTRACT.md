@@ -12,9 +12,17 @@ dashboard.
 `duration`, and `order_id`.
 
 `dose` is a string. Canonicalization trims and normalizes it as a finite,
-positive decimal, rejects values over `1,000,000`, and rejects input longer than
-64 characters. `units` is lowercased in the canonical form. Other required text
-fields must be non-empty.
+positive decimal, rejects values over `1,000,000`, rejects input longer than
+64 characters, and rejects a canonical representation longer than 128
+characters. `5`, `5.0`, and `5.00` therefore have the same canonical dose.
+Supported unit spellings are explicit: `mg`, `milligram`, and `milligrams`
+canonicalize to `mg`, while `synthetic-units` remains `synthetic-units`. Other
+units are rejected. Other required text fields must be non-empty, and unknown
+action fields are rejected.
+
+Canonical JSON is UTF-8, sorted by key, compact (`(',', ':')` separators), and
+does not allow non-finite JSON values. Persisted approval JSON is parsed with
+duplicate-key rejection and must already equal the canonical representation.
 
 ## Audit event format
 
@@ -45,14 +53,32 @@ file or database errors are propagated and the gateway fails closed.
 ## Tables
 
 - `actors(actor_id, role)`
-- `patients(patient_id, name_synthetic)`
-- `approvals(approval_id, action_hash, action_json, approver_id, created_at, expires_at, revoked, consumed)`
+- `patients(patient_id, name_synthetic, org_id)`
+- `approvals(approval_id, action_hash, action_json, approver_id, created_at, expires_at, revoked, consumed, approval_mac)`
 - `orders(order_id, patient_id, medication_id, dose, units, route, frequency, duration)`
 - `audit_events(id, time, request_id, actor_id, tool, action_type, approval_id, decision, risk, rule, reason, changed_fields, state_changed)`
 - `tool_baseline(tool_name, fingerprint, allowed_destination)`
+- `organizations(org_id, name, created_at)`
+- `memberships(org_id, actor_id, role, active)`
+- `documents(document_id, org_id, owner_actor_id, encrypted paths, content digests, processing/review status, sanitized detection report, deletion lifecycle fields, and signed receipt fields)`
 
 The default database is `medishield.sqlite3` at the repository root. Tests may
 inject a temporary path or an open SQLite connection.
+
+`approval_mac` is an HMAC-SHA-256 authentication tag computed by the trusted
+backend over the approval ID, canonical action, action fingerprint, clinician
+ID, creation time, expiry time, policy tool, exact destination, and a schema
+version. Its key is loaded only
+from `MEDISHIELD_APPROVAL_SECRET` and must be at least 32 UTF-8 bytes. The
+gateway uses `hmac.compare_digest`; it never accepts an agent-supplied hash or
+MAC as proof. Rows without a valid tag fail closed.
+
+Backend approval creation, revocation, order-state reads, and patient-record
+reads require a server-resolved `WorkspaceUser` context. The backend
+re-reads that actor's active membership and role from SQLite; a caller-supplied
+role, organization, or Boolean authorization value is not accepted as proof.
+Patient and approval operations are additionally checked against the stored
+patient organization. Calls without this context fail closed.
 
 ## MCP Trust Sentinel
 
@@ -79,13 +105,14 @@ The gateway checks, in this order:
 
 1. Validate the request schema and all protected fields.
 2. Inspect and verify the declared MCP registry with the Trust Sentinel.
-3. Validate the actor's role.
+3. Validate the actor's role and active membership in the patient's organization.
 4. Pin the policy tool, the SQLite tool baseline, its fingerprint, and its exact destination.
-5. Validate that the approval exists, is unexpired, is not revoked, is not consumed, and was issued by a clinician.
-6. Recompute the protected-action hash and compare it with the stored approval hash.
-7. Atomically consume the approval, write the order through `apply_order`, and write the audit event.
-8. Audit every outcome that can be persisted safely.
-9. Fail closed whenever a check, backend write, or audit write cannot be completed safely.
+5. Validate the approval's canonical action, stored content fingerprint, and gateway authentication tag.
+6. Validate the approval exists, has valid UTC timestamps, is unexpired, is not revoked, is not consumed, was issued by a clinician, and is scoped to the patient's organization.
+7. Recompute the protected-action hash and compare it with the authenticated approval hash.
+8. Atomically consume the approval, write the order through `apply_order`, and write the audit event.
+9. Audit every outcome that can be persisted safely.
+10. Fail closed whenever a check, backend write, or audit write cannot be completed safely.
 
 The MCP tool `execute_approved_order` always uses the policy name
 `update_order` and delegates to `verify_execution`; it does not write the
@@ -94,6 +121,71 @@ The MCP tool `execute_approved_order` always uses the policy name
 Registry drift blocks before approval consumption or order mutation. The block
 reason carries compact sentinel context so the forensic reader can report the
 expected and observed fingerprints without copying patient or action data.
+
+The patient-record and security-event MCP tools also require a server-created
+trusted local-demo context. An agent-supplied actor or organization string is
+not sufficient. Patient scope is checked against the patient's stored
+organization, and security-event reads are restricted to audit/admin roles.
+The local context adapter is synthetic and must be replaced by authenticated
+transport context before any real deployment.
+
+Normal dispatcher calls inspect the live FastMCP registry through the Trust
+Sentinel. An explicit registry override is permitted only by the isolated
+synthetic tampering demonstration; it is not a normal-operation way to declare
+an untrusted registry trusted.
+
+Before `get_patient_record` releases data to the MCP caller, its response is
+validated as the expected structured patient/order shape, checked against the
+requested patient and authenticated organization, bounded to 256 orders and
+64 KiB of compact UTF-8 JSON, and reduced to synthetic patient fields. Unknown
+or malformed output is blocked and audited. This response guard validates the
+declared structured response; it does not establish the safety of an arbitrary
+Python callable, dependency, or remote MCP server.
+
+Approval creation and revocation also create low-risk lifecycle audit events.
+Those lifecycle operations are available only after a server-resolved clinician
+context has been revalidated by the backend; passing `clinician_1` as a string
+alone is insufficient.
+The audit hash-chain verifier detects inconsistencies across the mutable SQLite
+and JSONL stores, but it is not append-only storage and cannot stop an operator
+with write access from rewriting every record and recomputing the chain.
+
+## Synthetic document privacy contract
+
+Document operations use a server-resolved active membership, never a trusted
+client organization or role. `org_admin`, `clinician`, and `privacy_officer`
+may upload; `org_admin` and `privacy_officer` may approve or reject privacy
+review; researchers may retrieve only approved de-identified derivatives;
+clinicians/privacy officers/org admins may retrieve approved originals; and
+read-only auditors receive metadata/integrity status only. Unknown roles and
+missing memberships fail closed.
+
+The upload boundary accepts only UTF-8 TXT, PDF, PNG, and JPEG signatures up to
+10 MiB. Stored original and derivative files are AES-256-GCM envelopes with a
+fresh nonce and associated document/tenant/variant metadata. The master key
+comes from `MEDISHIELD_DOCUMENT_KEY`; the separate pseudonym key comes from
+`MEDISHIELD_PSEUDONYM_SECRET`. There is no fallback key. Original and
+derivative SHA-256 digests are checked before plaintext is returned. A failed
+authentication or digest check returns no content and records a sanitized
+blocked audit event.
+
+Text detection is deterministic and rule-based. Results are always marked for
+human review and the report records categories/counts only, not matched
+values. Image OCR is not configured in this MVP, so images remain manual
+review items without a de-identified derivative. Missing malware scanning is
+reported as `not_configured` and is never represented as a clean scan.
+
+The local identity selector is development-only authentication. This MVP does
+not claim a real identity provider, complete de-identification, clinical
+correctness, regulatory compliance, or MCP exposure of document operations.
+
+Privacy receipts are signed with a separate Ed25519 key pair loaded from
+`MEDISHIELD_RECEIPT_SIGNING_PRIVATE_KEY` and
+`MEDISHIELD_RECEIPT_SIGNING_PUBLIC_KEY`. Audit checkpoints use a different
+pair loaded from `MEDISHIELD_AUDIT_CHECKPOINT_PRIVATE_KEY` and
+`MEDISHIELD_AUDIT_CHECKPOINT_PUBLIC_KEY`. Missing or malformed key material
+fails closed. Ordinary SHA-256 digests remain fingerprints and are not approval
+authentication.
 
 ## Dashboard Integration Contract
 
@@ -154,21 +246,28 @@ demo_result = tool_registry_tampering()
 
 ### 4. Protected Execution & Patient Data Retrieval
 ```python
-from server.mcp_server import get_patient_record, execute_approved_order
+from server.db import initialize_db
+from server.mcp_server import get_patient_record, execute_approved_order, trusted_execution_context
+
+connection = initialize_db()
 
 # Protected patient retrieval (fails closed with PermissionError on drift):
 try:
-    patient_data = get_patient_record(patient_id="P-104")
+    with trusted_execution_context(connection, "clinician_1", "ORG-DEMO"):
+        patient_data = get_patient_record(patient_id="P-104")
 except PermissionError as exc:
     # Denied before database record was accessed
+    pass
 
 # Protected order execution:
-decision = execute_approved_order(
-    request_id="REQ-001",
-    actor_id="agent_1",
-    approval_id="APR-001",
-    action=action,
-)
+with trusted_execution_context(connection, "agent_1", "ORG-DEMO"):
+    decision = execute_approved_order(
+        request_id="REQ-001",
+        actor_id="agent_1",
+        approval_id="APR-001",
+        action=action,
+    )
+connection.close()
 ```
 
 ### 5. Retrieving Structured Forensic Evidence

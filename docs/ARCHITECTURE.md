@@ -14,13 +14,46 @@
    `orders` table and requires the gateway's caller-owned transaction.
 7. `guard/audit.py` writes the contract event to SQLite and appends the same
    JSON object to `logs/events.jsonl`.
-8. The Streamlit dashboard reads the shared repository-root database and calls
+8. `guard/checkpoints.py` can sign the current audit-ledger head with a
+   separate Ed25519 checkpoint key.
+9. The Streamlit dashboard reads the shared repository-root database and calls
    the same gateway/demo functions used by the tests.
+10. `privacy/deid.py`, `privacy/crypto.py`, `privacy/receipts.py`, and
+   `privacy/vault.py` provide the
+   tenant-scoped synthetic document workflow without bypassing the clinical
+   gateway.
 
 The protected flows are:
 
-- **Approved Execution**: `propose action` → `clinician approval record` → `MCP execution request` → `registry trust sentinel` → `gateway authorization and pinning` → `hash comparison` → `single-use consume + order update + audit`.
-- **Patient Record Retrieval**: `get_patient_record request` → `registry trust sentinel` → `gateway verification` → (if trusted) `query patient demographics & orders` / (if drifted) `audit blocked attempt + fail closed (PermissionError)` without accessing patient state.
+- **Approved Execution**: `propose action` → `clinician approval record + gateway authentication tag` → `MCP execution request` → `registry trust sentinel` → `gateway authorization and pinning` → `authenticated approval and action-hash comparison` → `single-use consume + order update + audit`.
+- **Patient Record Retrieval**: authenticated local-demo context → `registry trust sentinel` → organization/role check → (if trusted) `query patient demographics & orders` / (if drifted or unauthorized) `audit blocked attempt + fail closed (PermissionError)` without invoking the protected handler.
+
+- **Patient Response Release**: after the protected read, the MCP wrapper
+  validates the response shape, requested patient and tenant scope, order
+  fields, item count, and encoded size. It removes internal organization
+  metadata before release. Invalid or oversized output is blocked and audited;
+  an audit failure also fails closed. This is structured response validation,
+  not proof that an arbitrary tool callable or remote server is trustworthy.
+
+- **Document Privacy**: local-demo membership lookup → local file signature and
+  size validation → rule-based PHI detection → encrypted original and
+  derivative storage → privacy-officer review → tenant- and role-checked
+  retrieval → AES-GCM authentication and SHA-256 verification → sanitized
+  audit event. No uploaded content is sent to an external service.
+
+The document flow uses additive SQLite tables (`organizations`,
+`memberships`, and `documents`). Encrypted files are kept outside public
+directories under `.medishield_vault/`; file names are generated document
+identifiers rather than upload names. A missing key, failed decryption,
+content digest mismatch, unknown membership, unsupported file, or missing
+privacy review blocks the operation.
+
+Each accepted upload or review also receives a signed, non-content privacy
+receipt containing encrypted-artifact digests, pipeline version, review state,
+and its audit-event reference. Receipt signing uses a dedicated Ed25519 key
+pair and does not establish that de-identification is complete. Document
+deletion is a recoverable pending/failed/deleted state transition with a
+retained metadata tombstone and an explicit reconciliation operation.
 
 ## Trust Sentinel
 
@@ -38,6 +71,9 @@ and is intended for direct tests and demonstrations. Dedicated demo helpers
 `server.mcp_server.tamper_runtime_registry()` and `restore_runtime_registry()`
 allow non-destructive live demonstration and verification. They are not extra
 MCP tools, so the public MCP surface remains the existing five tools.
+The normal `dispatch_mcp_tool_call()` path also consults the live FastMCP
+registry. Its optional registry override is reserved for the isolated synthetic
+tampering demonstration and is not a normal-operation trust source.
 
 ## Forensic evidence & Audit Trail Integrity
 
@@ -56,13 +92,20 @@ cross-store verification (`guard.forensics.verify_audit_integrity`):
 - **Reordering detection**: Checked via strict UTC timestamp monotonicity and sequence ID ordering.
 - Timestamps are real UTC values; no immutable guarantees are falsely claimed for mutable operating system files.
 
+Signed checkpoints add an independently verifiable signature over the current
+SQLite ledger head. They detect a changed ledger when the checkpoint and public
+key are available, but they do not make the checkpoint file append-only.
+
 ## Clinical Intent Lock
 
 The approval stores canonical action JSON and a SHA-256 digest calculated by
-the server. At execution, the gateway validates the structured action,
-canonicalizes it again, recomputes the digest, and compares it with the stored
-approval. The agent cannot provide a replacement digest to make a changed
-action valid.
+the server. It also stores an HMAC-SHA-256 tag created from a gateway-only
+secret and the complete approval envelope: approval ID, action, action digest,
+clinician ID, creation time, expiry time, and schema version. At execution, the
+gateway validates the structured action, validates the persisted canonical JSON,
+recomputes the tag and digest, and compares both with the stored values. The
+agent cannot provide a replacement digest or tag to make a changed action
+valid. Missing or invalid secret configuration fails closed.
 
 The check covers the patient, medication, dose, units, route, frequency,
 duration, and order ID. Decimal dose normalization makes equivalent decimal
@@ -71,12 +114,14 @@ negative, oversized, or overly long input.
 
 ## Transaction boundary
 
-The gateway begins an immediate SQLite transaction before protected checks that
-need database state. A successful path consumes the approval, calls
-`apply_order`, writes the audit event, and commits. A backend or audit failure
-rolls back the order and approval and returns a blocked decision. The JSONL
-append is not a SQLite transaction; a filesystem failure is propagated and the
-gateway does not report success.
+When it owns the transaction boundary, the gateway begins an immediate SQLite
+transaction before protected checks that need database state. A successful path
+consumes the approval, calls `apply_order`, writes the audit event, and commits.
+When a caller supplies an already-active transaction, the gateway uses a
+savepoint and does not commit the caller's work. A backend or audit failure
+rolls back the protected unit and returns a blocked decision. The JSONL append
+is not a SQLite transaction; a filesystem failure is propagated and the gateway
+does not report success.
 
 ## Trust boundaries
 
@@ -86,6 +131,8 @@ gateway does not report success.
 - The policy module and the required `tool_baseline` row provide the synthetic
   tool/destination baseline.
 - The dashboard is a demonstration client, not an authority.
+- The local trusted execution context is only an adapter for this synthetic
+  demo; it is not a replacement for a real authenticated session.
 
 The prototype checks the exact registered fingerprint and destination for
 `update_order`. This is a focused demonstration control and does not promise
@@ -95,7 +142,23 @@ does not hash or verify the Python callable, source, bytecode, dependencies, or
 remote implementation behind a tool. A source baseline update is a manual maintenance change;
 the runtime never accepts a new registry merely because it was observed.
 
-The backend compatibility helper also requires a private gateway capability;
-calling it directly does not create a second protected execution path. The
-guard-off demo is the sole deliberate exception, and it calls `apply_order`
-only inside a temporary synthetic fixture marked as intentionally vulnerable.
+The privacy service is currently available through the dashboard and direct
+backend service APIs, not as new MCP tools. This is a deliberate safe MVP
+boundary: the existing five-tool registry remains unchanged and its reviewed
+sentinel baseline remains valid. A future MCP document surface must add
+narrowly scoped tools and a reviewed registry baseline before exposure.
+
+The backend compatibility helper and `apply_order` require a private gateway
+capability; calling either directly without that capability does not create a
+second protected execution path. Patient-record, order-state, approval
+creation, and approval-revocation helpers also require a server-resolved
+`WorkspaceUser` and re-read active membership and role from SQLite. The
+patient organization is checked before a record or order state is returned.
+The guard-off demo is the sole deliberate execution exception, and it passes
+the internal capability only inside a temporary synthetic fixture marked as
+intentionally vulnerable. The local context remains a demo adapter, not real
+user authentication.
+
+The Trust Sentinel fingerprints declared MCP interfaces, including output
+schemas, but does not verify the Python callable, source, bytecode,
+dependencies, or remote server behind a matching declaration.

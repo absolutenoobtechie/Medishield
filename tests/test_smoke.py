@@ -9,6 +9,8 @@ MODULES = [
     "guard.gateway",
     "guard.policy",
     "guard.audit",
+    "guard.sentinel",
+    "guard.forensics",
     "server.db",
     "server.backend",
     "server.mcp_server",

@@ -1,6 +1,7 @@
 """Integration tests for MediShield gateway security enforcement."""
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 import pytest
 
 from guard.approval import compute_approval_mac
@@ -29,8 +30,11 @@ def create_approval(conn, approval_id, action_dict, approver_id="clinician_1"):
     action_obj = ProtectedAction(**action_dict)
     h = action_hash(action_obj)
     action_json = canonicalize_action(action_obj)
-    created_at = "2026-10-14T00:00:00Z"
-    expires_at = "2026-10-15T00:00:00Z"
+    now = datetime.now(timezone.utc)
+    created = now - timedelta(minutes=1)
+    expires = now + timedelta(hours=1)
+    created_at = created.isoformat().replace("+00:00", "Z")
+    expires_at = expires.isoformat().replace("+00:00", "Z")
     approval_mac = compute_approval_mac(
         approval_id=approval_id,
         action_json=action_json,

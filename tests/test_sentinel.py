@@ -3,6 +3,7 @@
 import copy
 import sqlite3
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -40,8 +41,11 @@ def _approval(connection, approval_id="APR-SENTINEL-001"):
     action = _action()
     action_json = canonicalize_action(action)
     action_digest = action_hash(action)
-    created_at = "2026-10-14T00:00:00Z"
-    expires_at = "2026-10-15T00:00:00Z"
+    now = datetime.now(timezone.utc)
+    created = now - timedelta(minutes=1)
+    expires = now + timedelta(hours=1)
+    created_at = created.isoformat().replace("+00:00", "Z")
+    expires_at = expires.isoformat().replace("+00:00", "Z")
     connection.execute(
         """
         INSERT INTO approvals(

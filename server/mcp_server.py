@@ -603,12 +603,7 @@ def get_security_events(limit: int = 20) -> list[dict[str, Any]]:
         connection.close()
 
 
-from guard.sentinel import (
-    RegistryVerificationResult,
-    check_registry,
-    get_trusted_baseline_tools,
-    verify_registry,
-)
+from guard.sentinel import check_registry, get_trusted_baseline_tools, verify_registry
 
 _active_registry: list[dict[str, Any]] = get_trusted_baseline_tools()
 
@@ -643,11 +638,29 @@ def dispatch_mcp_tool_call(
     if registry_override is None:
         # Normal dispatch must inspect the live FastMCP registry. The mutable
         # active-registry snapshot is retained only for the isolated demo UI.
-        sentinel_result: RegistryVerificationResult = check_registry()
+        sentinel_result = check_registry()
+        registry_status = sentinel_result.status.upper()
+        registry_allowed = sentinel_result.protected_execution_allowed
+        registry_reason = sentinel_result.explanation
+        registry_expected_fingerprint = sentinel_result.expected_fingerprint
+        registry_observed_fingerprint = sentinel_result.observed_fingerprint
+        registry_fingerprints_match = (
+            registry_expected_fingerprint is not None
+            and registry_observed_fingerprint is not None
+            and registry_expected_fingerprint == registry_observed_fingerprint
+        )
+        registry_differences = sentinel_result.differences
     else:
         # The override is dependency injection for the synthetic tampering
         # demonstration, not a normal-operation trust source.
         sentinel_result = verify_registry(registry_override)
+        registry_status = sentinel_result.status
+        registry_allowed = sentinel_result.status == "TRUSTED" and sentinel_result.fingerprints_match
+        registry_reason = sentinel_result.reason
+        registry_expected_fingerprint = sentinel_result.expected_fingerprint
+        registry_observed_fingerprint = sentinel_result.observed_fingerprint
+        registry_fingerprints_match = sentinel_result.fingerprints_match
+        registry_differences = sentinel_result.differences
 
     close_after = False
     if connection is None:
@@ -655,7 +668,7 @@ def dispatch_mcp_tool_call(
         close_after = True
 
     try:
-        if sentinel_result.status != "TRUSTED":
+        if not registry_allowed:
             record_audit_event(
                 {
                     "time": ts,
@@ -667,8 +680,8 @@ def dispatch_mcp_tool_call(
                     "decision": "blocked",
                     "risk": "high",
                     "rule": "registry drift detected",
-                    "reason": f"MCP Trust Sentinel detected tool registry drift: {sentinel_result.reason}",
-                    "changed_fields": sentinel_result.differences,
+                    "reason": f"MCP Trust Sentinel detected tool registry drift: {registry_reason}",
+                    "changed_fields": registry_differences,
                     "state_changed": False,
                 },
                 connection=connection,
@@ -682,12 +695,12 @@ def dispatch_mcp_tool_call(
                 "tool": tool_name,
                 "decision": "blocked",
                 "rule": "registry drift detected",
-                "reason": f"Execution halted fail-closed by MediShield Sentinel: {sentinel_result.reason}",
-                "sentinel_status": sentinel_result.status,
-                "expected_fingerprint": sentinel_result.expected_fingerprint,
-                "observed_fingerprint": sentinel_result.observed_fingerprint,
-                "fingerprints_match": sentinel_result.fingerprints_match,
-                "differences": sentinel_result.differences,
+                "reason": f"Execution halted fail-closed by MediShield Sentinel: {registry_reason}",
+                "sentinel_status": registry_status,
+                "expected_fingerprint": registry_expected_fingerprint,
+                "observed_fingerprint": registry_observed_fingerprint,
+                "fingerprints_match": registry_fingerprints_match,
+                "differences": registry_differences,
                 "handler_invoked": False,
                 "patient_record_returned": None,
                 "data": None,
@@ -712,11 +725,11 @@ def dispatch_mcp_tool_call(
                     "decision": "blocked",
                     "rule": "patient access denied",
                     "reason": "Authenticated organization permission was required for patient-record access.",
-                    "sentinel_status": "TRUSTED",
-                    "expected_fingerprint": sentinel_result.expected_fingerprint,
-                    "observed_fingerprint": sentinel_result.observed_fingerprint,
-                    "fingerprints_match": True,
-                    "differences": [],
+                    "sentinel_status": registry_status,
+                    "expected_fingerprint": registry_expected_fingerprint,
+                    "observed_fingerprint": registry_observed_fingerprint,
+                    "fingerprints_match": registry_fingerprints_match,
+                    "differences": registry_differences,
                     "handler_invoked": False,
                     "patient_record_returned": None,
                     "data": None,
@@ -732,11 +745,11 @@ def dispatch_mcp_tool_call(
                 "decision": "allowed",
                 "rule": "registry verified",
                 "reason": "MCP tool registry verified. Authorized patient record retrieved.",
-                "sentinel_status": "TRUSTED",
-                "expected_fingerprint": sentinel_result.expected_fingerprint,
-                "observed_fingerprint": sentinel_result.observed_fingerprint,
-                "fingerprints_match": True,
-                "differences": [],
+                "sentinel_status": registry_status,
+                "expected_fingerprint": registry_expected_fingerprint,
+                "observed_fingerprint": registry_observed_fingerprint,
+                "fingerprints_match": registry_fingerprints_match,
+                "differences": registry_differences,
                 "handler_invoked": True,
                 "patient_record_returned": patient_response,
                 "data": patient_record,
@@ -757,7 +770,11 @@ def dispatch_mcp_tool_call(
                     "decision": "blocked",
                     "rule": "security-event access denied",
                     "reason": "An authenticated audit role was required for security-event access.",
-                    "sentinel_status": "TRUSTED",
+                    "sentinel_status": registry_status,
+                    "expected_fingerprint": registry_expected_fingerprint,
+                    "observed_fingerprint": registry_observed_fingerprint,
+                    "fingerprints_match": registry_fingerprints_match,
+                    "differences": registry_differences,
                     "handler_invoked": False,
                     "data": None,
                     "state_changed": False,
@@ -770,7 +787,11 @@ def dispatch_mcp_tool_call(
                 "decision": "allowed",
                 "rule": "registry verified",
                 "reason": "Security events retrieved successfully.",
-                "sentinel_status": "TRUSTED",
+                "sentinel_status": registry_status,
+                "expected_fingerprint": registry_expected_fingerprint,
+                "observed_fingerprint": registry_observed_fingerprint,
+                "fingerprints_match": registry_fingerprints_match,
+                "differences": registry_differences,
                 "handler_invoked": True,
                 "data": events,
                 "state_changed": False,
@@ -784,7 +805,11 @@ def dispatch_mcp_tool_call(
                 "decision": "blocked",
                 "rule": "unsupported dispatch path",
                 "reason": "This dispatcher does not authorize unreviewed tool execution.",
-                "sentinel_status": "TRUSTED",
+                "sentinel_status": registry_status,
+                "expected_fingerprint": registry_expected_fingerprint,
+                "observed_fingerprint": registry_observed_fingerprint,
+                "fingerprints_match": registry_fingerprints_match,
+                "differences": registry_differences,
                 "handler_invoked": False,
                 "data": None,
                 "state_changed": False,

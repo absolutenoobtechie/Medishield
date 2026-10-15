@@ -1,5 +1,18 @@
 # MediShield architecture and security notes
 
+## Zero-trust trust zones
+
+MediShield treats the agent, prompt context, and tool arguments as an
+untrusted zone; MCP is the protocol boundary; the gateway is the authoritative
+reference monitor; and SQLite plus the dual audit stores are the authoritative
+synthetic backend. A protected call therefore follows the same eight-stage
+sequence on every path: strict request validation, server-resolved actor role,
+tool/destination and registry checks, approval state and expiry, canonical
+intent and authentication-tag verification, atomic single-use consumption and
+backend mutation, audit persistence, and commit. Any failed stage rolls back
+protected state and records a blocked outcome. This is the conceptual
+zero-trust model used by the judge-facing protocol and threat-model documents.
+
 ## Components
 
 1. The MCP wrapper accepts structured synthetic tool calls.

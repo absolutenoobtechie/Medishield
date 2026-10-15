@@ -37,6 +37,17 @@ comparison and approval authentication` → `single-use consume + order update +
 See [ARCHITECTURE.md](ARCHITECTURE.md) and [CONTRACT.md](CONTRACT.md) for the
 field-level contract and threat-model notes.
 
+## Documentation map
+
+The merge also carries the judge-facing protocol and demonstration material:
+
+- [MCP_DEMO.md](MCP_DEMO.md) — reproducible Windows MCP and attack walkthrough.
+- [MCP_SPECIFICATION.md](MCP_SPECIFICATION.md) — exposed tool contracts and transport notes.
+- [THREAT_MODEL.md](THREAT_MODEL.md) — STRIDE-style threat analysis and mitigations.
+
+All paths above are repository-relative so the documentation works in a local
+checkout and on Git hosting.
+
 ## Windows PowerShell setup
 
 Run these commands from the repository root with Python 3.11 or newer:

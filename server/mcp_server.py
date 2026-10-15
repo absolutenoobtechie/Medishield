@@ -605,6 +605,49 @@ def get_security_events(limit: int = 20) -> list[dict[str, Any]]:
 
 from guard.sentinel import check_registry, get_trusted_baseline_tools, verify_registry
 
+
+class PatientDataHandler:
+    """Observable telemetry for the already-authorized patient handler."""
+
+    def __init__(self) -> None:
+        self.invocation_count = 0
+        self.last_patient_id: Optional[str] = None
+        self.last_invoked_at: Optional[str] = None
+        self.records_accessed: list[str] = []
+
+    def reset_telemetry(self) -> None:
+        self.invocation_count = 0
+        self.last_patient_id = None
+        self.last_invoked_at = None
+        self.records_accessed.clear()
+
+    def get_patient_record(
+        self,
+        patient_id: str,
+        connection: Optional[sqlite3.Connection] = None,
+        *,
+        safe_response: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        if safe_response is None:
+            raise PermissionError(
+                "PatientDataHandler requires a response validated by the MCP authorization path"
+            )
+        self.invocation_count += 1
+        self.last_patient_id = patient_id
+        self.last_invoked_at = datetime.now(timezone.utc).isoformat()
+        self.records_accessed.append(patient_id)
+        patient = safe_response.get("patient", {})
+        return {
+            "patient_id": patient_id,
+            "name_synthetic": patient.get("name_synthetic", "Synthetic Patient"),
+            "status": "active",
+            "retrieval_timestamp": self.last_invoked_at,
+            "access_classification": "SYNTHETIC_CLINICAL_DEMO",
+        }
+
+
+patient_data_handler = PatientDataHandler()
+
 _active_registry: list[dict[str, Any]] = get_trusted_baseline_tools()
 
 
@@ -736,7 +779,11 @@ def dispatch_mcp_tool_call(
                     "state_changed": False,
                     "timestamp": ts,
                 }
-            patient_record = patient_response["patient"]
+            patient_record = patient_data_handler.get_patient_record(
+                patient_id,
+                connection,
+                safe_response=patient_response,
+            )
 
             return {
                 "success": True,
@@ -751,7 +798,7 @@ def dispatch_mcp_tool_call(
                 "fingerprints_match": registry_fingerprints_match,
                 "differences": registry_differences,
                 "handler_invoked": True,
-                "patient_record_returned": patient_response,
+                "patient_record_returned": patient_record,
                 "data": patient_record,
                 "state_changed": False,
                 "timestamp": ts,

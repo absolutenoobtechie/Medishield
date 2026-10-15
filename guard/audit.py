@@ -184,7 +184,9 @@ def record_audit_event(
     normalized = dict(event)
     normalized.setdefault("time", None)
     normalized.setdefault("request_id", "")
-    normalized.setdefault("actor", normalized.get("actor_id", "unknown"))
+    actor_id = normalized.pop("actor_id", None)
+    if "actor" not in normalized or normalized["actor"] is None:
+        normalized["actor"] = actor_id if actor_id is not None else "unknown"
     normalized.setdefault("tool", "unknown")
     normalized.setdefault("action_type", normalized.get("tool", "unknown"))
     normalized.setdefault("approval_id", None)
@@ -192,8 +194,14 @@ def record_audit_event(
     normalized.setdefault("risk", "medium")
     normalized.setdefault("rule", "unknown")
     normalized.setdefault("reason", "")
-    normalized.setdefault("changed_fields", [])
-    normalized.setdefault("state_changed", False)
+    raw_changed_fields = normalized.get("changed_fields", [])
+    normalized["changed_fields"] = (
+        list(raw_changed_fields)
+        if isinstance(raw_changed_fields, (list, tuple, set))
+        else []
+    )
+    normalized["state_changed"] = bool(normalized.get("state_changed", False))
+    normalized = {field: normalized[field] for field in AUDIT_FIELDS}
     return write_event(
         normalized,
         connection=connection,

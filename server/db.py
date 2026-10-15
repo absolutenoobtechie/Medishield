@@ -13,9 +13,18 @@ DEFAULT_DB_PATH = REPOSITORY_ROOT / "medishield.sqlite3"
 def get_connection(db_path: PathLike = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Open a SQLite connection with rows addressable by column name."""
 
-    if str(db_path) != ":memory:":
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(db_path))
+    target = Path(db_path)
+    if not target.is_absolute() and str(target) != ":memory:":
+        cwd = Path.cwd().resolve()
+        try:
+            inside_repository = cwd.is_relative_to(REPOSITORY_ROOT)
+        except AttributeError:
+            inside_repository = str(cwd).startswith(str(REPOSITORY_ROOT))
+        if inside_repository:
+            target = REPOSITORY_ROOT / target
+    if str(target) != ":memory:":
+        target.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(target))
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -163,8 +172,11 @@ def seed_data(connection: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO actors(actor_id, role) VALUES (?, ?)",
         [
             ("clinician_1", "clinician"),
+            ("clinician_2", "clinician"),
             ("nurse_1", "nurse"),
             ("agent_1", "agent"),
+            ("pharmacist_1", "pharmacist"),
+            ("service_account_1", "service_account"),
             ("privacy_1", "privacy_officer"),
             ("researcher_1", "researcher"),
             ("auditor_1", "read_only_auditor"),
@@ -175,12 +187,16 @@ def seed_data(connection: sqlite3.Connection) -> None:
     connection.executemany(
         "INSERT OR IGNORE INTO patients(patient_id, name_synthetic, org_id) VALUES (?, ?, ?)",
         [
+            ("P-101", "Synthetic Patient Echo", "ORG-DEMO"),
+            ("P-102", "Synthetic Patient Foxtrot", "ORG-DEMO"),
             ("P-104", "Synthetic Patient Alpha", "ORG-DEMO"),
             ("P-205", "Synthetic Patient Beta", "ORG-DEMO"),
+            ("P-318", "Synthetic Patient Gamma", "ORG-DEMO"),
+            ("P-422", "Synthetic Patient Delta", "ORG-DEMO"),
         ],
     )
     connection.execute(
-        "UPDATE patients SET org_id = 'ORG-DEMO' WHERE patient_id IN ('P-104', 'P-205') AND (org_id IS NULL OR org_id = '')"
+        "UPDATE patients SET org_id = 'ORG-DEMO' WHERE org_id IS NULL OR org_id = ''"
     )
     # Keep apply_order as the only order-table writer, including for demo data.
     from guard.models import ProtectedAction
@@ -206,6 +222,48 @@ def seed_data(connection: sqlite3.Connection) -> None:
             connection=connection,
             _gateway_token=_GATEWAY_EXECUTION_TOKEN,
         )
+    additional_demo_orders = [
+        ProtectedAction(
+            patient_id="P-205",
+            medication_id="MED-B",
+            dose="500",
+            units="mg",
+            route="oral",
+            frequency="twice daily",
+            duration="14 days",
+            order_id="ORD-DEMO-002",
+        ),
+        ProtectedAction(
+            patient_id="P-318",
+            medication_id="MED-C",
+            dose="250",
+            units="mg",
+            route="oral",
+            frequency="three times daily",
+            duration="10 days",
+            order_id="ORD-DEMO-003",
+        ),
+        ProtectedAction(
+            patient_id="P-422",
+            medication_id="MED-D",
+            dose="10",
+            units="mg",
+            route="subcutaneous",
+            frequency="daily",
+            duration="30 days",
+            order_id="ORD-DEMO-004",
+        ),
+    ]
+    for demo_action in additional_demo_orders:
+        if connection.execute(
+            "SELECT 1 FROM orders WHERE order_id = ?",
+            (demo_action.order_id,),
+        ).fetchone() is None:
+            apply_order(
+                demo_action,
+                connection=connection,
+                _gateway_token=_GATEWAY_EXECUTION_TOKEN,
+            )
     connection.execute(
         """
         INSERT OR IGNORE INTO tool_baseline(
@@ -228,9 +286,12 @@ def seed_data(connection: sqlite3.Connection) -> None:
     connection.executemany(
         "INSERT OR IGNORE INTO memberships(org_id, actor_id, role, active) VALUES (?, ?, ?, 1)",
         [
+            ("ORG-DEMO", "clinician_2", "clinician"),
             ("ORG-DEMO", "clinician_1", "clinician"),
             ("ORG-DEMO", "nurse_1", "nurse"),
             ("ORG-DEMO", "agent_1", "agent"),
+            ("ORG-DEMO", "pharmacist_1", "pharmacist"),
+            ("ORG-DEMO", "service_account_1", "service_account"),
             ("ORG-DEMO", "privacy_1", "privacy_officer"),
             ("ORG-DEMO", "researcher_1", "researcher"),
             ("ORG-DEMO", "auditor_1", "read_only_auditor"),

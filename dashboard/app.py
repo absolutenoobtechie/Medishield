@@ -264,7 +264,44 @@ def load_events(db_path: Optional[Path] = None) -> Tuple[List[Dict[str, Any]], s
     except Exception:
         pass
 
-    # 2. Fallback to sample_events.jsonl
+    # 2. Read the append-only JSONL companion store when SQLite has no rows.
+    # This keeps the dashboard aligned with the audit module's dual-store
+    # contract without treating JSONL as an authorization source.
+    events_jsonl_path = ROOT_DIR / "logs" / "events.jsonl"
+    if events_jsonl_path.exists():
+        loaded_events: List[Dict[str, Any]] = []
+        try:
+            with events_jsonl_path.open("r", encoding="utf-8") as handle:
+                for idx, line in enumerate(handle):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    item["id"] = item.get("id", idx)
+                    loaded_events.append(item)
+        except OSError:
+            loaded_events = []
+        if loaded_events:
+            loaded_events.sort(
+                key=lambda e: (str(e.get("time") or ""), int(e.get("id") or 0)),
+                reverse=True,
+            )
+            for idx, ev in enumerate(loaded_events):
+                ev.setdefault("changed_fields", [])
+                ev.setdefault("state_changed", False)
+                dept_code, dept_name = resolve_event_department(ev)
+                ev["department"] = dept_code
+                ev["department_name"] = dept_name
+                ev["display_id"] = resolve_event_display_id(ev, fallback_index=idx + 1)
+                ev["dosage_comparison"] = extract_event_dosage_comparison(ev, approvals_map)
+                if ev.get("approval_id") and ev["approval_id"] in approvals_map:
+                    ev["approved_action"] = approvals_map[ev["approval_id"]]
+            return loaded_events, "Dual-Store Audit Log (logs/events.jsonl)"
+
+    # 3. Fallback to sample_events.jsonl
     jsonl_path = ROOT_DIR / "logs" / "sample_events.jsonl"
     if jsonl_path.exists():
         with open(jsonl_path, "r", encoding="utf-8") as f:

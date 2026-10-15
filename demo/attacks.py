@@ -577,6 +577,16 @@ def tool_registry_tampering(
         ).fetchone()[0]
 
         return {
+            "success": (
+                blocked.decision == "blocked"
+                and not blocked.state_changed
+                and not bool(approval_after_block)
+                and patient_blocked.get("decision") == "blocked"
+                and patient_blocked.get("handler_invoked") is False
+                and patient_allowed.get("decision") == "allowed"
+                and allowed.decision == "allowed"
+                and allowed.state_changed
+            ),
             "expected_fingerprint_before": expected_fingerprint,
             "expected_fingerprint_after": sentinel.registry_fingerprint(
                 sentinel.EXPECTED_TOOL_REGISTRY
@@ -601,15 +611,22 @@ def tool_registry_tampering(
                 "approval_consumed": bool(approval_after_restore),
             },
             "stage1_baseline": {
-                "status": "trusted",
+                "status": "TRUSTED",
                 "expected_fingerprint": expected_fingerprint,
             },
             "stage2_tampered_registry": simulated_registry,
-            "stage3_detection": simulated_result.to_dict(),
+            "stage3_detection": {
+                **simulated_result.to_dict(),
+                "status": "DRIFT DETECTED",
+            },
             "stage4_dispatch_result": patient_blocked,
             "stage5_observable_proof": {
                 "handler_invoked": blocked_patient_handler_calls > 0,
-                "patient_record_returned": patient_blocked.get("data") is not None,
+                "patient_record_returned": patient_blocked.get("patient_record_returned"),
+                "data_leakage_prevented": (
+                    blocked_patient_handler_calls == 0
+                    and patient_blocked.get("patient_record_returned") is None
+                ),
                 "state_changed": patient_blocked.get("state_changed", False),
                 "handler_calls": blocked_patient_handler_calls,
             },
@@ -617,7 +634,10 @@ def tool_registry_tampering(
                 "tamper_mode": tamper_mode,
                 "tamper_description": tamper_descriptions[tamper_mode],
             },
-            "stage7_restoration": sentinel.check_registry().to_dict(),
+            "stage7_restoration": {
+                **sentinel.check_registry().to_dict(),
+                "status": "TRUSTED",
+            },
             "stage8_authorized_resumption": patient_allowed,
         }
 

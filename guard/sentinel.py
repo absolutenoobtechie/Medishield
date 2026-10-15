@@ -175,6 +175,12 @@ class TrustResult:
     explanation: str
     protected_execution_allowed: bool
 
+    @property
+    def reason(self) -> str:
+        """Compatibility alias for callers using the dashboard-facing name."""
+
+        return self.explanation
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
@@ -182,6 +188,7 @@ class TrustResult:
             "observed_fingerprint": self.observed_fingerprint,
             "differences": list(self.differences),
             "explanation": self.explanation,
+            "reason": self.explanation,
             "protected_execution_allowed": self.protected_execution_allowed,
         }
 
@@ -546,8 +553,37 @@ def verify_registry(
         errors.append(err)
         differences.append(err)
 
+    canonical_observed: list[dict[str, Any]] = []
+    for item in valid_observed:
+        try:
+            canonical_observed.append(canonicalize_registry([item])[0])
+        except Exception as exc:
+            # An unexpected tool with an incomplete declaration is still
+            # observable registry drift. Expected tools remain a verification
+            # error when their declaration cannot be canonicalized.
+            name = str(item.get("name", ""))
+            fallback = {
+                "name": name,
+                "title": item.get("title"),
+                "description": str(item.get("description", "")).strip(),
+                "inputSchema": item.get("inputSchema", {})
+                if isinstance(item.get("inputSchema", {}), Mapping)
+                else {},
+                "outputSchema": item.get("outputSchema", {})
+                if isinstance(item.get("outputSchema", {}), Mapping)
+                else {},
+                "annotations": item.get("annotations"),
+                "icons": item.get("icons"),
+                "meta": item.get("meta"),
+            }
+            canonical_observed.append(fallback)
+            if name in expected_map:
+                errors.append(f"Failed to canonicalize expected tool {name}: {exc}")
+            else:
+                differences.append(f"Malformed unexpected tool definition: {name}")
+
+    valid_observed = sorted(canonical_observed, key=lambda item: item["name"])
     try:
-        valid_observed = canonicalize_registry(valid_observed)
         observed_fp = compute_registry_fingerprint(valid_observed)
     except Exception as exc:
         err = f"Failed to compute observed registry fingerprint: {str(exc)}"

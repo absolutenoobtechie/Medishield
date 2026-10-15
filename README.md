@@ -1,375 +1,537 @@
-# 🛡️ MediShield: Runtime Security Gateway for MCP-Connected AI Tools
+# MediShield — Runtime Security Gateway for MCP-Connected Clinical AI
 
-[![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.30.0-purple.svg)](https://modelcontextprotocol.io/)
-[![Security Tests](https://img.shields.io/badge/Security%20Tests-24%2F24%20Passing-emerald.svg)]()
-[![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)]()
+> Hackathon prototype: a fail-closed runtime security boundary for synthetic
+> healthcare workflows driven through the Model Context Protocol (MCP).
 
-> **Hackathon Prototype & Security Demonstration**
-> MediShield is a runtime security gateway designed to secure AI tool execution via the **Model Context Protocol (MCP)**. It acts as an authoritative, fail-closed mediation layer between autonomous AI agents and sensitive simulated clinical backends, preventing parameter tampering, prompt injection tool hijacking, unauthorized role execution, and approval replay.
+MediShield sits between an AI-agent-style caller and a simulated clinical
+backend. It verifies that a proposed state-changing action is structurally
+valid, authorized for the caller and tenant, bound to a trusted tool
+declaration and destination, explicitly approved by a clinician, and still
+valid at execution time. It is a security demonstration, not a clinical
+product, medical advice, or a regulatory-compliance system.
 
----
+All patients, orders, actors, documents, and audit events in this repository
+are synthetic.
 
-## Table of Contents
+## What it solves
 
-- [1. Executive Summary](#1-executive-summary)
-- [2. The Problem: The MCP Tool Execution Gap](#2-the-problem-the-mcp-tool-execution-gap)
-- [3. What MediShield Solves](#3-what-medishield-solves)
-- [4. Core Security Invariants](#4-core-security-invariants)
-- [5. System Architecture](#5-system-architecture)
-  - [5.1 Component Overview](#51-component-overview)
-  - [5.2 Execution Flow Diagram](#52-execution-flow-diagram)
-  - [5.3 Adversarial Interception Diagram](#53-adversarial-interception-diagram)
-- [6. MCP Server & Tool Contract](#6-mcp-server--tool-contract)
-  - [6.1 MCP SDK & Protocol Transport](#61-mcp-sdk--protocol-transport)
-  - [6.2 Tool Definitions & Target Destinations](#62-tool-definitions--target-destinations)
-  - [6.3 Gateway Mediation Pattern](#63-gateway-mediation-pattern)
-- [7. Repository Structure](#7-repository-structure)
-- [8. Security Verification Matrix](#8-security-verification-matrix)
-- [9. Quick-Start Guide (Windows PowerShell)](#9-quick-start-guide-windows-powershell)
-  - [Prerequisites](#prerequisites)
-  - [Installation & Setup](#installation--setup)
-  - [Running the Security Test Suite](#running-the-security-test-suite)
-  - [Launching the Security Dashboard](#launching-the-security-dashboard)
-- [10. MCP Inspector & Client Connection Guide](#10-mcp-inspector--client-connection-guide)
-- [11. Threat Model & Mitigations](#11-threat-model--mitigations)
-- [12. Limitations & Production Roadmap](#12-limitations--production-roadmap)
-- [13. Standards & References](#13-standards--references)
-- [14. AI Use & Compliance Disclosure](#14-ai-use--compliance-disclosure)
+MCP standardizes tool declarations and invocation, but application-level
+authorization for high-consequence operations remains the application’s
+responsibility. An agent can be induced to alter a dose, substitute a
+patient, replay an approval, invoke a tool with the wrong role, or operate
+against a changed tool declaration.
 
----
+MediShield addresses that execution-boundary problem with:
 
-## 1. Executive Summary
+- Strict Pydantic contracts for protected actions and execution requests.
+- Deterministic action canonicalization and SHA-256 content hashing.
+- Gateway-controlled HMAC authentication for approval records.
+- Clinician-scoped, tenant-scoped, time-limited, revocable, single-use
+  approvals.
+- Explicit role, organization-membership, tool-baseline, and destination
+  checks.
+- MCP Trust Sentinel verification before protected handlers are reached.
+- Atomic approval consumption, backend mutation, and audit recording.
+- Tenant-scoped encrypted document processing and privacy review.
+- Read-only forensic evidence and optional signed audit checkpoints.
 
-Autonomous AI agents integrated with external systems through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) can generate and trigger sensitive tool calls, such as writing orders, issuing payments, or mutating backend databases. However, LLMs are fundamentally non-deterministic and susceptible to **prompt injection**, **jailbreaking**, **hallucination**, and **context contamination**.
+## B2B healthcare use case
 
-MediShield introduces a **Runtime Security Gateway** and **Deterministic Intent Lock** to MCP tool execution:
-1. **Clinician Intent Lock:** High-consequence actions require explicit clinician pre-authorization. The gateway computes an invariant cryptographic digest of canonicalized action parameters.
-2. **Runtime Verification:** When an agent invokes an MCP tool, the gateway intercepts the request, independently recomputes the canonical hash, enforces role permissions, checks tool/destination pinning, and validates single-use approval tokens.
-3. **Fail-Closed Execution:** Any discrepancy—whether tampered dosage, substituted patient identifier, expired token, or unpinned destination—aborts execution, rolls back state, and generates an audit log entry.
+The intended B2B scenario is a healthcare organization using an AI agent to
+assist with clinical workflows while retaining human authorization over
+high-consequence changes:
 
-*All data in this demonstration is strictly synthetic and intended for architectural evaluation.*
+1. A clinician approves one structured synthetic medication action.
+2. An AI client submits the approved action through the MCP boundary.
+3. MediShield verifies the authenticated local-demo identity, tenant scope,
+   tool registry, destination, approval status, and action fingerprint.
+4. Only an exact, active approval can reach the simulated order writer.
+5. Every allowed or blocked outcome is recorded for security operations review.
 
----
+The dashboard also demonstrates patient-directory access, privacy-reviewed
+documents, Trust Sentinel drift detection, and audit/forensic inspection.
+The local identity selector is a seeded demo adapter, not an enterprise
+identity provider.
 
-## 2. The Problem: The MCP Tool Execution Gap
+## Implemented components
 
-The Model Context Protocol standardizes how LLMs interact with external data sources and tools. While MCP standardizes protocol envelopes (JSON-RPC over stdio or SSE), it **does not define application-layer security semantics** for high-risk operations:
+### MCP boundary — server/mcp_server.py
 
-- **Parameter Tampering / Confused Deputy:** An LLM might be authorized to invoke `update_order`, but an indirect prompt injection or hallucination causes it to alter critical fields (e.g., changing medication dose from `5 mg` to `50 mg`).
-- **Target Substitution:** An agent invokes an approved action against a different recipient (e.g., patient `P-104` substituted for `P-205`).
-- **Approval Replay:** A single-use approval token is reused across multiple tool executions without server-side invalidation.
-- **Role Elevation:** An untrusted or lower-privilege agent executes high-privilege tools without role validation.
-- **Destination Hijack:** Tool definitions redirect queries or state mutations to untrusted third-party endpoints.
+The current FastMCP server declares these five tools:
 
-MediShield closes this gap by enforcing **authorization boundaries at the MCP tool boundary**.
+| MCP tool | Implemented behavior |
+| --- | --- |
+| get_patient_record | Retrieves one synthetic patient and that patient’s synthetic orders after Trust Sentinel verification, authenticated local-demo context, organization/role authorization, and response validation. |
+| propose_medication_order | Validates a ProtectedAction and returns a proposal without changing state. |
+| request_clinician_approval | Creates a time-limited approval from a server-authenticated clinician context. |
+| execute_approved_order | Builds an ExecutionRequest and delegates protected order execution to guard.gateway.verify_execution. It does not call the backend directly. |
+| get_security_events | Returns audit events visible to the authenticated audit or administrative role within the organization scope. |
 
----
+~~~powershell
+python -m server.mcp_server
+~~~
 
-## 3. What MediShield Solves
+The policy vocabulary in guard/policy.py also contains entries such as
+cancel_order and dispense_simulated, but this checkout does not expose those
+names as FastMCP handlers. The active MCP surface is the five tools listed
+above.
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        UNGUARDED MCP PIPELINE                          │
-│                                                                        │
-│  [LLM / Agent]  ──(JSON-RPC Tool Call)──▶  [MCP Server]  ──▶ [Backend] │
-│   ⚠️ Vulnerable to injection, tampering, replay, & rogue destinations   │
-└────────────────────────────────────────────────────────────────────────┘
+### Security guard and approval workflow
 
-┌────────────────────────────────────────────────────────────────────────┐
-│                      MEDISHIELD GUARDED PIPELINE                       │
-│                                                                        │
-│  [LLM / Agent]  ──(Tool Call)──▶ [MediShield Gateway] ──▶ [Backend]    │
-│                                           │                            │
-│                                  1. Schema Validation                  │
-│                                  2. Role Verification                  │
-│                                  3. Tool & Destination Pinning         │
-│                                  4. Intent Lock Hash Match             │
-│                                  5. Single-Use Replay Check            │
-│                                  6. Atomic DB Mutation                 │
-│                                  7. Dual-Store Audit Log               │
-└────────────────────────────────────────────────────────────────────────┘
-```
+- guard/models.py defines strict Pydantic contracts with extra fields rejected.
+- guard/intent.py validates and canonicalizes patient, medication, dose, units,
+  route, frequency, duration, and order. Doses are finite positive decimal
+  strings with demo sanity limits; supported unit aliases are explicit.
+- guard/approval.py authenticates the complete persisted approval record with
+  HMAC-SHA-256 using MEDISHIELD_APPROVAL_SECRET. The action hash is a content
+  fingerprint; it is not approval authenticity by itself.
+- server/backend.py creates and revokes approvals only through an authenticated
+  clinician context. Approval rows include the canonical action, action hash,
+  timestamps, revocation/consumption state, and authentication tag.
+- guard/policy.py contains role permissions and pinned destinations.
+- guard/gateway.py is the authoritative protected execution path. It validates
+  the request, checks registry trust, resolves actor role and patient
+  organization, checks the database tool baseline and destination, authenticates
+  and validates the approval, enforces expiry/revocation/single-use state,
+  compares the recomputed action hash, and invokes the backend only after all
+  checks pass.
+- server/backend.apply_order() is the sole order-table writer and requires a
+  private gateway capability. The gateway uses a transaction or savepoint so
+  approval consumption, order update, and audit outcome can roll back together.
 
-MediShield guarantees that **no tool execution takes effect unless it matches an authorized clinician intent byte-for-byte**.
+### MCP Trust Sentinel — guard/sentinel.py
 
----
+The Sentinel stores an explicit reviewed registry in source control; it never
+learns a trusted baseline from the observed runtime registry. It canonicalizes
+and fingerprints tool names, descriptions, input/output schemas, and interface
+metadata, then compares the live FastMCP registry with that baseline.
 
-## 4. Core Security Invariants
+The protected path fails closed on missing or unexpected tools, tool renaming,
+input or output schema drift, interface metadata drift, registry inspection
+failure, and invalid or missing trusted baseline data.
 
-As mandated by our engineering guidelines ([AGENTS.md](AGENTS.md)):
+demo/attacks.py and the MCP Trust Sentinel dashboard page demonstrate
+tampering, handler non-invocation, restoration, and authorized resumption.
 
-1. **Fail-Closed Architecture:** Any unknown, malformed, expired, revoked, or altered request is rejected. System exceptions abort transactions and write security events.
-2. **Never Trust Agent-Supplied Hashes:** The gateway never consumes hashes provided by the AI client. It independently recomputes digests from the submitted payload.
-3. **Deterministic Canonicalization:** Canonical JSON sorting, `Decimal`-normalized doses (e.g. `5.0` ➔ `5`), and lowercased units ensure stable, unambiguous hashing.
-4. **Timing-Safe Digest Comparison:** Hashes are evaluated using `hmac.compare_digest` to prevent timing side-channel attacks.
-5. **Atomic Single-Use Consumption:** Approvals are consumed in the exact same database transaction that applies the backend change.
-6. **Immutable Dual-Channel Auditing:** Outcomes (both allowed and blocked) are recorded in SQLite and appended to a persistent JSONL audit trail.
+### Patient directory and EHR demonstration
 
----
+dashboard/patient_view.py provides the Patient Directory & EHR page.
+server/backend.py reads synthetic patients and orders only through an
+authenticated local-demo organization context. The MCP patient path validates
+response shape, patient identifier, tenant scope, order fields, item count,
+and serialized response size before releasing a minimized response. Invalid
+or oversized responses are blocked and audited.
 
-## 5. System Architecture
+This is a simulated SQLite backend, not an EHR or FHIR integration.
 
-### 5.1 Component Overview
+### Secure document vault and privacy workflow
 
-- **Host / MCP Client:** Claude Desktop, an autonomous agent runtime, or test runner communicating over stdio.
-- **MediShield MCP Server (`server/mcp_server.py`):** Protocol boundary exposing tools using the official `mcp` Python SDK.
-- **Security Gateway (`guard/gateway.py`):** The core enforcement point executing the 8-step verification pipeline.
-- **Intent Engine (`guard/intent.py`):** Schema canonicalization (`canonicalize_action`) and SHA-256 digest computation (`action_hash`).
-- **Policy Engine (`guard/policy.py`):** Role-based permissions (`TOOL_PERMISSIONS`) and destination pinning (`PINNED_DESTINATIONS`).
-- **Simulated Backend (`server/backend.py`, `server/db.py`):** SQLite transactional store for orders, actors, and approvals.
-- **Audit Logger (`guard/audit.py`):** SQLite table `audit_events` and append-only log `logs/events.jsonl`.
-- **Security Dashboard (`dashboard/app.py`):** Streamlit monitoring console and attack simulation laboratory.
+privacy/vault.py and dashboard/document_vault.py implement a tenant-scoped
+local workflow:
 
-### 5.2 Execution Flow Diagram
+1. Validate filename, extension, file signature, UTF-8 content where
+   applicable, and a 10 MiB demo size limit.
+2. Extract text from TXT and text-based PDF files using local code.
+3. Detect rule-based PHI-like identifiers with privacy/deid.py.
+4. Generate a redacted or organization-scoped pseudonymized derivative, or
+   keep detection-only mode without creating a retrievable derivative.
+5. Encrypt originals and derivatives with AES-256-GCM using
+   MEDISHIELD_DOCUMENT_KEY.
+6. Require explicit privacy-officer review before retrieval.
+7. Enforce organization and role permissions for metadata, derivative
+   retrieval, original retrieval, and deletion.
+8. Verify decrypted content against stored SHA-256 digests.
+9. Store a signed, non-content privacy receipt when receipt-signing keys are
+   configured.
+10. Support recoverable deletion states with metadata tombstones and
+    reconciliation.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Clinician
-    actor Agent as AI Agent (MCP Client)
-    participant MCP as MediShield MCP Server
-    participant Gateway as Security Gateway
-    participant Intent as Intent Engine
-    participant DB as SQLite Backend
-    participant Audit as Audit Log (DB & JSONL)
+Supported uploads are TXT, PDF, PNG, and JPEG. Local OCR is not configured,
+so image uploads remain manual-review items. PDF extraction may require manual
+review when no text is available or the PDF is encrypted.
 
-    Clinician->>DB: Pre-authorize action (Action, Approver, TTL)
-    DB->>Intent: Canonicalize & Hash (SHA-256)
-    DB-->>Clinician: Return approval_id (e.g., APR-001)
+### Audit and forensic evidence
 
-    Agent->>MCP: Call tool: update_order(request_id, approval_id, action)
-    MCP->>Gateway: Forward ExecutionRequest
-    Gateway->>Gateway: Step 1: Validate Pydantic Schema (extra=forbid)
-    Gateway->>DB: Step 2: Query Actor Role (actors table)
-    Gateway->>Gateway: Step 3: Check Tool & Destination Pinning
-    Gateway->>DB: Step 4: Fetch Approval (unexpired, unconsumed, unrevoked)
-    Gateway->>Intent: Step 5: Recompute action_hash from submitted action
-    Gateway->>Gateway: Compare hashes (hmac.compare_digest)
+guard/audit.py records structured decisions in SQLite table audit_events and
+the append-only JSONL file logs/events.jsonl.
 
-    alt Hashes Match & Checks Pass
-        Gateway->>DB: Step 6: Atomic BEGIN IMMEDIATE (mark consumed, apply order)
-        Gateway->>Audit: Step 7: Record Allowed Audit Event
-        Gateway-->>MCP: Decision: ALLOWED (state_changed=True)
-        MCP-->>Agent: Tool Result: Success
-    else Hashes Mismatch or Check Fails
-        Gateway->>DB: Rollback Transaction (State Unaltered)
-        Gateway->>Audit: Record Blocked Audit Event (with changed_fields)
-        Gateway-->>MCP: Decision: BLOCKED (Fail-Closed)
-        MCP-->>Agent: Tool Result: Error: Action Rejected
-    end
-```
+guard.audit.verify_audit_log_integrity() checks event normalization, sequence
+continuity, timestamp ordering, hash-chain consistency, and SQLite/JSONL parity
+where both stores are available. This is tamper evidence, not immutable or
+WORM storage.
 
-### 5.3 Adversarial Interception Diagram
+guard/forensics.py provides read-only evidence records without copying
+protected action contents into the evidence record. guard/checkpoints.py can
+sign the current audit-ledger head with a separate Ed25519 key pair. The
+checkpoint file itself remains ordinary mutable filesystem storage.
 
-```mermaid
-flowchart TD
-    Attacker["Adversarial Vector (Prompt Injection / Rogue Tool Call)"] -->|Tampered Payload: dose 50mg| ToolCall["MCP Tool: update_order"]
-    ToolCall --> Gateway["MediShield Gateway (guard/gateway.py)"]
+### Streamlit dashboard
 
-    subgraph Verification Checks
-        Gateway --> C1{"Valid Schema?"}
-        C1 -- No --> BlockSchema["BLOCKED: malformed request"]
-        C1 -- Yes --> C2{"Actor Permitted?"}
-        C2 -- No --> BlockRole["BLOCKED: role not permitted"]
-        C2 -- Yes --> C3{"Destination Pinned?"}
-        C3 -- No --> BlockDest["BLOCKED: destination not pinned"]
-        C3 -- Yes --> C4{"Approval Valid & Active?"}
-        C4 -- No --> BlockApp["BLOCKED: approval expired / revoked / consumed"]
-        C4 -- Yes --> C5{"Computed Hash == Stored Hash?"}
-        C5 -- No --> BlockHash["BLOCKED: intent hash mismatch"]
-    end
+dashboard/app.py is the Streamlit entry point. It currently provides:
 
-    BlockHash --> AuditRollback["1. Rollback DB Transaction<br/>2. Changed Fields: ['dose']<br/>3. Write High-Risk Audit Event"]
-    AuditRollback --> BackendUntouched[("Simulated Clinical DB<br/>STATE UNTOUCHED")]
+- Overview
+- Patient Directory & EHR
+- Clinician Approval Hub
+- Intent Lock Verification
+- MCP Trust Sentinel
+- Secure Document Vault
+- Security Test Lab
+- Audit Log & Forensic Ledger
 
-    C5 -- Yes --> Allow["ALLOWED: Atomic Commit Order & Consume Approval"]
-    Allow --> BackendMutated[("Simulated Clinical DB<br/>ORDER UPDATED")]
+Reusable visual components are in dashboard/theme.py. Feature views are in
+dashboard/patient_view.py, dashboard/approval_view.py,
+dashboard/sentinel_view.py, dashboard/document_vault.py, and
+dashboard/forensics_view.py.
 
-    style BlockHash fill:#fee2e2,stroke:#ef4444,stroke-width:2px;
-    style BlockSchema fill:#fee2e2,stroke:#ef4444,stroke-width:2px;
-    style BlockRole fill:#fee2e2,stroke:#ef4444,stroke-width:2px;
-    style BlockDest fill:#fee2e2,stroke:#ef4444,stroke-width:2px;
-    style BlockApp fill:#fee2e2,stroke:#ef4444,stroke-width:2px;
-    style Allow fill:#dcfce7,stroke:#22c55e,stroke-width:2px;
-    style BackendUntouched fill:#e0f2fe,stroke:#0284c7,stroke-width:2px;
-```
+## Architecture
 
----
+~~~mermaid
+flowchart LR
+    A[AI agent or MCP client] -->|stdio JSON-RPC| M[FastMCP server]
+    M --> S[Trust Sentinel]
+    S -->|trusted registry| G[Security gateway]
+    G --> P[Role, tenant, destination and approval checks]
+    P --> I[Canonical intent and HMAC verification]
+    I --> T[Atomic transaction]
+    T --> B[SQLite synthetic backend]
+    T --> L[SQLite audit_events plus logs/events.jsonl]
+    S -->|drift or unverifiable| X[Blocked and audited]
+    G -->|failure| X
+~~~
 
-## 6. MCP Server & Tool Contract
+### Protected order workflow
 
-### 6.1 MCP SDK & Protocol Transport
+1. propose_medication_order validates the structured action without writing.
+2. A server-authenticated clinician calls request_clinician_approval.
+3. server/backend.py canonicalizes the action, computes its SHA-256 hash,
+   creates timestamps, and authenticates the approval with the gateway HMAC.
+4. The caller submits execute_approved_order.
+5. The MCP boundary verifies trusted context and constructs an
+   ExecutionRequest for the internal policy tool update_order.
+6. The gateway checks the live registry, tenant and role, pinned destination,
+   database baseline, approval authenticity, timestamps, revocation, expiry,
+   consumption state, and recomputed action hash.
+7. On an exact match, SQLite marks the approval consumed, writes the order,
+   records the audit event, and commits.
+8. On failure, protected state is not committed and a blocked decision is
+   recorded where the audit store is available.
 
-- **SDK:** Official Python Model Context Protocol SDK (`mcp>=1.9,<2.0`, installed: `mcp 1.30.0`).
-- **Standard Transport:** `stdio` (standard input/output JSON-RPC 2.0 frames).
-- **Network Transport:** Streamable via Server-Sent Events (SSE) or stdio pipe to local LLM clients.
+### Patient-record workflow
 
-### 6.2 Tool Definitions & Target Destinations
+A trusted local-demo context is resolved from SQLite. The Sentinel verifies
+the declared MCP registry before the backend handler is reached. The user
+must have patient_read permission and active membership in the patient’s
+organization. The response is validated and minimized before release.
+Registry drift, missing context, tenant mismatch, response-shape drift,
+handler failure, or audit failure causes a denial.
 
-MediShield manages 5 sensitive clinical MCP tools governed by immutable policy baselines:
+### Document workflow
 
-| Tool Name | Permitted Roles | Target Pinned Destination | Purpose |
-| :--- | :--- | :--- | :--- |
-| `update_order` | `agent`, `clinician` | `backend://simulated-ehr/orders` | Mutates a medication order |
-| `read_patient_summary` | `agent`, `clinician`, `nurse` | `backend://simulated-ehr/patients` | Reads read-only synthetic patient records |
-| `approve_action` | `clinician` | `backend://simulated-ehr/approvals` | Issues a cryptographic intent lock |
-| `cancel_order` | `clinician` | `backend://simulated-ehr/orders` | Revokes or discontinues an active order |
-| `dispense_simulated` | `clinician`, `pharmacist` | `backend://simulated-pharmacy/dispense` | Triggers simulated medication dispensing |
+The vault uses organization-scoped SQLite metadata and encrypted files below
+.medishield_vault/. It does not send uploaded content to an external service.
+Uploads remain pending until privacy review; retrieval requires the appropriate
+organization membership and role.
 
-### 6.3 Gateway Mediation Pattern
+## Repository structure
 
-When an MCP client invokes `update_order`, the tool payload maps to an `ExecutionRequest` validated by Pydantic:
-
-```python
-class ProtectedAction(_StrictModel):
-    patient_id: str
-    medication_id: str
-    dose: str
-    units: str
-    route: str
-    frequency: str
-    duration: Optional[str] = None
-    order_id: str
-
-class ExecutionRequest(_StrictModel):
-    request_id: str
-    actor_id: str
-    tool: str
-    approval_id: str
-    action: ProtectedAction
-```
-
----
-
-## 7. Repository Structure
-
-```
+~~~text
 Medishield/
-├── .gitignore                  # Git exclusions (.venv, *.sqlite3, logs, etc.)
-├── AGENTS.md                   # Contributor guardrails, folder ownership, core rules
-├── requirements.txt            # Minimal verified dependencies (mcp, pydantic, streamlit, pytest)
-├── README.md                   # Project overview, MCP architecture, quickstart
-│
-├── guard/                      # [Person 1] MediShield Security Gateway & Intent Engine
-│   ├── __init__.py             # Security engine package
-│   ├── audit.py                # Dual persistence (SQLite audit_events + logs/events.jsonl)
-│   ├── gateway.py              # verify_execution() runtime check & atomic transaction logic
-│   ├── intent.py               # canonicalize_action() and action_hash() SHA-256 engine
-│   ├── models.py               # Strict Pydantic contracts (extra="forbid")
-│   └── policy.py               # Role permissions and pinned destination registry
-│
-├── server/                     # [Person 2] Simulated Clinical Backend & MCP Boundary
-│   ├── __init__.py             # Backend package
-│   ├── backend.py              # Approval creation, state mutations, order transactions
-│   ├── db.py                   # SQLite schema definitions and synthetic seed data
-│   └── mcp_server.py           # MCP server protocol entry point
-│
-├── dashboard/                  # [Person 3] Security Operations Console
-│   └── app.py                  # Streamlit real-time monitoring and test lab
-│
-├── demo/                       # [Person 4] Executable Attack Demonstrations
-│   └── attacks.py              # 8 programmatic attack scenarios + 1 control scenario
-│
-├── docs/                       # Technical Documentation & Architectural Specifications
-│   ├── ARCHITECTURE.md         # In-depth architectural flow, sequence diagrams, & contracts
-│   ├── CONTRACT.md             # Authoritative audit format and check sequencing
-│   ├── MCP_DEMO.md             # Reproducible step-by-step PowerShell testing guide
-│   ├── MCP_SPECIFICATION.md    # Model Context Protocol integration specification
-│   ├── README.md               # Documentation guide index
-│   └── THREAT_MODEL.md         # MCP threat vectors, STRIDE analysis, and mitigations
-│
-├── logs/                       # Audit log storage
-│   ├── sample_events.jsonl     # Sample synthetic audit events
-│   └── events.jsonl            # Runtime audit log (generated dynamically)
-│
-└── tests/                      # Automated Test Suite
-    ├── test_attacks.py         # 9 tests verifying adversarial attacks are blocked
-    ├── test_backend_audit.py   # 11 tests for approval lifecycles and audit durability
-    ├── test_gateway_security.py# 4 tests for gateway authorization & hash verification
-    └── test_smoke.py           # Scaffold module import smoke test
-```
+├── .streamlit/config.toml       # Streamlit theme and server settings
+├── AGENTS.md                    # Contributor rules and security invariants
+├── README.md                    # This overview and operating guide
+├── requirements.txt             # Runtime and test dependencies
+├── pytest.ini                   # Pytest discovery and repository import path
+├── dashboard/                   # Streamlit operations console
+│   ├── app.py                   # Entry point and navigation
+│   ├── theme.py                 # Shared UI components and theme helpers
+│   ├── patient_view.py          # Patient directory/EHR view
+│   ├── approval_view.py         # Approval creation, revocation and execution
+│   ├── sentinel_view.py        # Trust Sentinel and tampering demonstration
+│   ├── document_vault.py        # Privacy vault UI
+│   ├── forensics_view.py        # Audit and checkpoint UI
+│   ├── security_helpers.py      # Dashboard fixtures and gateway adapters
+│   └── dosage.py                # Audit-event dosage comparison helpers
+├── guard/                       # Security enforcement and evidence
+│   ├── approval.py              # Approval authentication
+│   ├── audit.py                 # Dual-store audit persistence and integrity
+│   ├── checkpoints.py           # Signed audit checkpoints
+│   ├── forensics.py             # Read-only evidence retrieval
+│   ├── gateway.py               # Authoritative execution verification
+│   ├── intent.py                # Canonical action and SHA-256 hashing
+│   ├── models.py                # Strict Pydantic contracts
+│   ├── policy.py                # Role and destination policy
+│   └── sentinel.py              # MCP registry trust verification
+├── server/                      # FastMCP boundary and synthetic backend
+│   ├── mcp_server.py            # Five current MCP tool handlers
+│   ├── backend.py               # Approvals, patients and order writes
+│   └── db.py                    # SQLite schema, migration and seed data
+├── privacy/                     # Tenant authorization and document privacy
+│   ├── auth.py                  # Local-demo organization membership
+│   ├── crypto.py                # AES-GCM, pseudonym and digest primitives
+│   ├── deid.py                  # Rule-based identifier detection
+│   ├── receipts.py              # Ed25519 privacy receipts
+│   └── vault.py                 # Encrypted document lifecycle
+├── demo/                        # Isolated synthetic demonstrations
+│   ├── attacks.py               # Attack, control and vault workflows
+│   └── seed_synthetic_events.py # Synthetic audit-event fixture generator
+├── logs/
+│   └── sample_events.jsonl      # Checked-in synthetic sample events
+├── docs/                        # Detailed architecture and demo notes
+└── tests/                       # Pytest suite for gateway, MCP, privacy and UI helpers
+~~~
 
----
+Runtime-generated files include the repository-root medishield.sqlite3,
+logs/events.jsonl, .medishield_vault/, and optionally
+logs/audit_checkpoints.jsonl. The database, runtime event log, vault, Python
+cache, and virtual environment are excluded by .gitignore where applicable.
 
-## 8. Security Verification Matrix
-
-All 8 adversarial scenarios and 1 control scenario are implemented in `demo/attacks.py` and systematically validated via `tests/test_attacks.py`:
-
-| Scenario ID | Test Name | Simulated Attack Vector | Expected Decision | Security Rule Enforced | State Changed? |
-| :---: | :--- | :--- | :---: | :--- | :---: |
-| **01** | `tamper_dose` | Agent modifies dose (`5 mg` ➔ `50 mg`) | **BLOCKED** | `intent hash mismatch` | `False` |
-| **02** | `substitute_patient` | Redirects order from `P-104` to `P-205` | **BLOCKED** | `intent hash mismatch` | `False` |
-| **03** | `unauthorized_actor` | Nurse attempts to invoke `update_order` | **BLOCKED** | `role not permitted` | `False` |
-| **04** | `replay_consumed_approval` | Replays already executed approval token | **BLOCKED** | `approval already consumed` | `False` |
-| **05** | `changed_destination` | Destination swapped to unpinned endpoint | **BLOCKED** | `destination not pinned` | `False` |
-| **06** | `expired_approval` | Submits token outside validity window | **BLOCKED** | `approval expired` | `False` |
-| **07** | `revoked_approval` | Clinician revoked token before execution | **BLOCKED** | `approval revoked` | `False` |
-| **08** | `prompt_injection_note` | Indirect injection text placed in patient notes | **ALLOWED** | `intent hash matched` | `True` (Protected fields isolated) |
-| **CTRL**| `valid_action` | Exact match with clinician approval | **ALLOWED** | `intent hash matched` | `True` |
-
----
-
-## 9. Quick-Start Guide (Windows PowerShell)
+## Windows PowerShell setup
 
 ### Prerequisites
 
-- Windows 10/11 with PowerShell 5.1+ or PowerShell 7+
-- Python 3.11 installed (`py --version` or `python --version`)
+- Windows 10 or 11.
+- PowerShell 5.1+ or PowerShell 7+.
+- Python 3.11 or newer.
+- Node.js and npx only if you want to use MCP Inspector.
 
-### Installation & Setup
+All commands below run from the repository root.
 
-1. Open PowerShell and navigate to the project directory:
-   ```powershell
-   cd c:\Users\User\Downloads\Medishield-main\Medishield-main
-   ```
+### Install
 
-2. Create a virtual environment:
-   ```powershell
-   py -3.11 -m venv .venv
-   ```
+~~~powershell
+cd C:/path/to/Medishield
+py -3.11 -m venv .venv
+./.venv/Scripts/Activate.ps1
+python -m pip install -r requirements.txt
+~~~
 
-3. Activate the virtual environment:
-   ```powershell
-   .\.venv\Scripts\Activate.ps1
-   ```
-   *(If script execution is disabled on your system, run: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`)*
+If PowerShell blocks activation for the current process:
 
-4. Install dependencies:
-   ```powershell
-   python -m pip install -r requirements.txt
-   ```
+~~~powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+./.venv/Scripts/Activate.ps1
+~~~
 
-### Running the Security Test Suite
+### Environment variables
 
-Run the verified test suite confirming all gateway, backend, and attack scenarios:
+Approval creation and protected order execution require at least 32 UTF-8
+bytes in MEDISHIELD_APPROVAL_SECRET:
 
-```powershell
-python -m pytest tests/test_attacks.py tests/test_backend_audit.py tests/test_gateway_security.py -v
-```
+~~~powershell
+$env:MEDISHIELD_APPROVAL_SECRET = (python -c "import secrets; print(secrets.token_hex(32))")
+~~~
 
-**Reference test command:**
-```text
-Run the command in the checkout to obtain the current result; this document does
-not hard-code a stale pass count.
-```
+The secure document workflow requires a separate 32-byte key in
+MEDISHIELD_DOCUMENT_KEY:
 
-### Launching the Security Dashboard
+~~~powershell
+$env:MEDISHIELD_DOCUMENT_KEY = (python -c "import secrets; print(secrets.token_hex(32))")
+~~~
 
-To start the real-time Security Operations Center (SOC) dashboard:
+Pseudonymization additionally requires the separate
+MEDISHIELD_PSEUDONYM_SECRET:
 
-```powershell
+~~~powershell
+$env:MEDISHIELD_PSEUDONYM_SECRET = (python -c "import secrets; print(secrets.token_hex(32))")
+~~~
+
+Keep these values in the current PowerShell session, do not commit or print
+them, and keep the approval secret unchanged between approval creation and
+execution. Missing or malformed values fail closed. The receipt and
+checkpoint key pairs below are required for those workflows:
+
+- MEDISHIELD_RECEIPT_SIGNING_PRIVATE_KEY
+- MEDISHIELD_RECEIPT_SIGNING_PUBLIC_KEY
+- MEDISHIELD_RECEIPT_SIGNING_KEY_ID
+- MEDISHIELD_AUDIT_CHECKPOINT_PRIVATE_KEY
+- MEDISHIELD_AUDIT_CHECKPOINT_PUBLIC_KEY
+- MEDISHIELD_AUDIT_CHECKPOINT_KEY_ID
+
+Use the key-generation procedure in docs/README.md or docs/DEMO_SCRIPT.md
+for Ed25519 pairs. Receipt keys are required for document upload/review;
+checkpoint keys are needed only when creating or verifying checkpoints.
+
+## Run the project
+
+### Test suite
+
+~~~powershell
+python -m pytest -q
+~~~
+
+pytest.ini discovers tests from tests/ and adds the repository to the import
+path. Coverage includes the gateway, canonicalization, approvals, rollback,
+audit integrity, MCP registry and patient authorization, dashboard security
+helpers, synthetic data, privacy vault, signed receipts, checkpoints, and
+forensic retrieval.
+
+Useful focused commands:
+
+~~~powershell
+python -m pytest -q tests/test_gateway_security.py tests/test_security_foundation.py
+python -m pytest -q tests/test_mcp_server.py tests/test_sentinel.py tests/test_sentinel_tampering.py
+python -m pytest -q tests/test_privacy_workflow.py tests/test_evidence.py
+~~~
+
+This README does not embed a stale pass count. During this update, the managed
+Codex environment could not complete collection with the repository local
+virtual-environment executable: it was inaccessible, and the fallback Python
+runtime stopped at collection because available Windows MCP dependencies
+included incompatible or missing binary modules, including pywintypes and rpds.
+No passing full-suite result is claimed from that environment. Run the command
+in a clean activated virtual environment after installing requirements.txt.
+
+### Streamlit dashboard
+
+~~~powershell
 python -m streamlit run dashboard/app.py
-```
+~~~
 
-The console opens at `http://localhost:8501`, featuring:
-- **📊 Overview:** Live metrics (allowed, blocked, warnings, error rate) and operational status.
-- **🧪 Security Test Lab:** Interactive buttons to trigger live attacks (`tamper_dose`, `substitute_patient`, `replay_consumed_approval`).
-- **🔍 Action Verification:** Playground to inspect canonical JSON sorting and SHA-256 digest output.
-- **📜 Audit Log:** Searchable, filterable event explorer reading live SQLite and JSONL events.
+The app uses the repository-root SQLite database. Open
+http://localhost:8501 if the browser does not open automatically.
+
+### MCP server and Inspector
+
+~~~powershell
+python -m server.mcp_server
+npx -y @modelcontextprotocol/inspector --cli python -m server.mcp_server --method tools/list
+~~~
+
+The server is a FastMCP stdio process, not a normal browser API or HTTP
+server. The Inspector requires Node.js and npx.
+
+### Synthetic command-line demonstrations
+
+These helpers create temporary databases and do not modify the repository
+database:
+
+~~~powershell
+python -c "from pprint import pprint; from demo.attacks import valid_action; pprint(valid_action())"
+python -c "from pprint import pprint; from demo.attacks import tamper_dose; pprint(tamper_dose())"
+python -c "from pprint import pprint; from demo.attacks import substitute_patient; pprint(substitute_patient())"
+python -c "from pprint import pprint; from demo.attacks import replay_consumed_approval; pprint(replay_consumed_approval())"
+python -c "from pprint import pprint; from demo.attacks import tool_registry_tampering; pprint(tool_registry_tampering())"
+python -c "from pprint import pprint; from demo.attacks import document_vault_workflow; pprint(document_vault_workflow())"
+~~~
+
+valid_action() is the exact-match control. Tampering, replay, and registry
+drift demonstrations should return blocked decisions. These are demonstration
+outputs; automated assertions are in tests/ and must be run separately.
+guard_off_vs_guard_on() intentionally calls the private simulated backend
+capability inside an isolated fixture to show an unguarded write versus a
+guarded rejection. It is not a production execution path.
+
+## Demonstrating the dashboard
+
+1. Configure MEDISHIELD_APPROVAL_SECRET and launch the Streamlit command.
+2. Select the synthetic organization and demo actor in the sidebar.
+3. Use Clinician Approval Hub to inspect, create, revoke, and execute
+   approvals. Backend authorization still applies; the UI does not grant it.
+4. Use Security Test Lab to run eight synthetic scenarios plus the exact-match
+   control. Review the actual decision, rule, changed fields, and state
+   comparison.
+5. Use MCP Trust Sentinel to run registry-tampering and confirm the protected
+   handler is not invoked while drift is present.
+6. Use Patient Directory & EHR to inspect tenant-scoped synthetic records.
+7. Configure document and receipt keys before using Secure Document Vault.
+   Upload a synthetic TXT/PDF/PNG/JPEG document, review the report, approve it
+   with the seeded privacy-officer identity, verify integrity, and retrieve a
+   role-permitted variant.
+8. Use Audit Log & Forensic Ledger to inspect events, run the hash-chain
+   check, and create or verify a signed checkpoint when keys are configured.
+
+A blocked dashboard decision demonstrates a security rejection; it is not by
+itself proof that an automated test assertion passed. Use the corresponding
+pytest test for that claim.
+
+## Security controls and source references
+
+| Control | Source |
+| --- | --- |
+| Strict request and action contracts | guard/models.py, guard/gateway.py |
+| Canonical JSON, decimal dose normalization and explicit units | guard/intent.py |
+| Approval MAC and secret validation | guard/approval.py, server/backend.py |
+| Role and destination policy | guard/policy.py, privacy/auth.py |
+| Tenant-scoped patient access and response validation | server/mcp_server.py, server/backend.py |
+| Registry name/schema/metadata fingerprinting | guard/sentinel.py |
+| Single-use approval consumption and rollback | guard/gateway.py, server/backend.py |
+| Structured dual-store audit persistence | guard/audit.py |
+| Audit hash-chain and forensic evidence | guard/audit.py, guard/forensics.py |
+| Signed audit checkpoints | guard/checkpoints.py |
+| AES-256-GCM document storage and integrity checks | privacy/crypto.py, privacy/vault.py |
+| Rule-based detection and pseudonymization | privacy/deid.py, privacy/crypto.py |
+| Signed privacy receipts | privacy/receipts.py, privacy/vault.py |
+
+## Known limitations and incomplete functionality
+
+MediShield is a synthetic, single-repository demonstration. The following
+are deliberately not claimed:
+
+- No real EHR, FHIR, SMART-on-FHIR, pharmacy, or external healthcare
+  integration.
+- No production identity provider, network authentication, session management,
+  external key-management service, or multi-process deployment protocol.
+- The seeded local identity selector is not proof of a user’s real identity.
+- Trust Sentinel verifies the declared tool interface. It does not prove that
+  a remote server, implementation, dependency, endpoint, or runtime behavior
+  is safe.
+- The approval HMAC secret is application configuration, not a complete
+  enterprise key-management system.
+- SQLite and JSONL writes are not one atomic cross-filesystem transaction.
+  The integrity verifier provides tamper evidence, not immutable storage.
+- The document detector is local and rule-based. It is not a complete
+  de-identification, malware-scanning, OCR, or compliance service.
+- Image OCR is not configured and unsupported PDF conditions require manual
+  review.
+- The current MCP registry contains five implemented handlers. Adding policy
+  names or new document tools requires a separately reviewed Sentinel baseline
+  update, handler implementation, authorization tests, and documentation.
+- docs/MCP_SPECIFICATION.md contains older target/reference material for tool
+  names and a placeholder implementation description. For active runtime
+  behavior, use server/mcp_server.py and guard/sentinel.py.
+
+## Troubleshooting
+
+- Approval authentication unavailable: set MEDISHIELD_APPROVAL_SECRET to at
+  least 32 UTF-8 bytes and keep it stable between approval creation and
+  execution.
+- Approval expired, revoked, consumed, or invalid: create a new approval; old
+  approvals are intentionally not repaired or silently reused.
+- Gateway reports a degraded environment: the dashboard checks database schema,
+  the action-hash self-test, and approval-secret configuration.
+- Document key or receipt errors: configure the required 32-byte document key
+  and Ed25519 receipt variables. Pseudonymization also needs its separate
+  32-byte secret.
+- Missing audit checkpoint key: checkpoint creation requires the private key
+  and key ID; verification requires the corresponding public key and key ID.
+- PowerShell activation fails: use Set-ExecutionPolicy -Scope Process
+  -ExecutionPolicy Bypass for the current process, or use an activated
+  environment.
+- Stale local approvals: rows from databases created before approval MAC
+  support are rejected by design. Create new approvals with the current secret
+  rather than bypassing verification.
+- MCP Inspector does not connect: verify Node.js/npx, the active virtual
+  environment, and the repository-root working directory.
+
+## Further documentation
+
+- AGENTS.md — contributor rules and non-negotiable invariants.
+- docs/README.md — extended setup, demos, privacy workspace, and verification.
+- docs/ARCHITECTURE.md — component and trust-zone details.
+- docs/CONTRACT.md — audit, approval, and privacy contracts.
+- docs/MCP_DEMO.md — Windows demonstration walkthrough.
+- docs/THREAT_MODEL.md — threat analysis and residual risk.
+- docs/MCP_SPECIFICATION.md — reference material; verify active handlers
+  against source as noted above.
+
+## Synthetic-data notice
+
+This repository contains only synthetic demonstration data. Do not upload
+real patient information, credentials, production keys, or regulated data.
 
 ---
 
+<<<<<<< HEAD
 ## 10. MCP Inspector & Client Connection Guide
 
 ### Current Server Status
@@ -492,3 +654,7 @@ i. Sambhav Barua
 
 
 
+=======
+_MediShield is a runtime security demonstration for the boundary where
+autonomous AI meets high-stakes action execution._
+>>>>>>> 146b3f3 (Update MediShield README documentation)

@@ -635,8 +635,9 @@ def tool_registry_tampering(
                 "tamper_description": tamper_descriptions[tamper_mode],
             },
             "stage7_restoration": {
-                **sentinel.check_registry().to_dict(),
+                **restored_result.to_dict(),
                 "status": "TRUSTED",
+                "fingerprints_match": restored_result.fingerprints_match,
             },
             "stage8_authorized_resumption": patient_allowed,
         }

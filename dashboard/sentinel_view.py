@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import hmac
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -31,6 +32,50 @@ from server.mcp_server import (
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
+def safe_fingerprints_match(stage_data: Any) -> bool:
+    """Safely determine if fingerprints matched, fail-closed on missing or legacy data.
+
+    Never reports True unless:
+    - stage_data is a dict
+    - both expected_fingerprint and observed_fingerprint are non-empty strings
+    - they match byte-for-byte using hmac.compare_digest
+    - if fingerprints_match flag is present, it must be True
+    - verification status indicates success or protected_execution_allowed is True
+    """
+    if not isinstance(stage_data, dict):
+        return False
+
+    raw_match = stage_data.get("fingerprints_match")
+    if raw_match is False:
+        return False
+
+    expected_fp = stage_data.get("expected_fingerprint")
+    observed_fp = stage_data.get("observed_fingerprint")
+    if not expected_fp or not observed_fp:
+        return False
+    if not isinstance(expected_fp, str) or not isinstance(observed_fp, str):
+        return False
+
+    if not hmac.compare_digest(expected_fp, observed_fp):
+        return False
+
+    status = str(stage_data.get("status", "")).upper()
+    allowed = stage_data.get("protected_execution_allowed")
+
+    # If status indicates drift, failure, or unverifiable, fail closed
+    if status in ("DRIFT DETECTED", "DRIFT", "VERIFICATION ERROR", "UNVERIFIABLE", "BASELINE_INVALID"):
+        return False
+
+    if allowed is False:
+        return False
+
+    # Verification must have actually succeeded
+    if status in ("TRUSTED", "RESTORED", "SUCCESS") or allowed is True or raw_match is True:
+        return True
+
+    return False
+
+
 def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Callable[[Any], str]) -> None:
     """Render the comprehensive MCP Trust Sentinel & Live Tampering Demonstration console."""
 
@@ -50,10 +95,12 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
         if st.button("🔄 Refresh Data", key="sentinel_top_ref_btn", use_container_width=True):
             st.session_state["last_refresh_time"] = datetime.now(timezone.utc)
             st.rerun()
+        refreshed_time = st.session_state.get("last_refresh_time")
+        refreshed_str = to_ist_string(refreshed_time) if refreshed_time else "Just now"
         st.markdown(
             f"""
             <div style="font-size: 0.72rem; color: #64748B; text-align: right; margin-top: -4px;">
-                Refreshed: <span style="font-weight: 600; color: #102A43;">{to_ist_string(st.session_state['last_refresh_time'])}</span>
+                Refreshed: <span style="font-weight: 600; color: #102A43;">{refreshed_str}</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -246,7 +293,7 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
             with st.spinner("Executing controlled MCP registry tampering in isolated sandbox..."):
                 sim_res = tool_registry_tampering(tamper_mode=tamper_mode, patient_id=target_patient)
                 st.session_state["sentinel_tamper_result"] = sim_res
-                st.session_state["sentinel_observed_tools"] = sim_res["stage2_tampered_registry"]
+                st.session_state["sentinel_observed_tools"] = sim_res.get("stage2_tampered_registry") if isinstance(sim_res, dict) else None
                 st.session_state["sentinel_status_override"] = "DRIFT DETECTED"
                 st.session_state["last_refresh_time"] = datetime.now(timezone.utc)
                 st.rerun()
@@ -276,8 +323,22 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
 
         # Render Simulation Results
         sim_data = st.session_state.get("sentinel_tamper_result")
-        if sim_data:
+        if isinstance(sim_data, dict):
             st.markdown("#### 🔬 Live Demonstration Telemetry & Forensic Findings")
+
+            s1 = sim_data.get("stage1_baseline") or {}
+            s1_fp = s1.get("expected_fingerprint") or ""
+            s1_fp_disp = f"{s1_fp[:16]}..." if s1_fp else "N/A"
+            s1_status = s1.get("status", "TRUSTED")
+
+            s6 = sim_data.get("stage6_evidence") or {}
+            s6_mode = s6.get("tamper_mode", "Unknown")
+            s6_desc = s6.get("tamper_description", "Tampering applied to isolated fixture.")
+
+            s3 = sim_data.get("stage3_detection") or {}
+            s3_fp = s3.get("observed_fingerprint") or ""
+            s3_fp_disp = f"{s3_fp[:16]}..." if s3_fp else "N/A"
+            s3_status = s3.get("status", "DRIFT DETECTED")
 
             st1, st2, st3 = st.columns(3)
             with st1:
@@ -285,9 +346,9 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
                     f"""
                     <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 14px;">
                         <div style="font-size: 0.76rem; color: #64748B; font-weight: 700; text-transform: uppercase;">Stage 1: Trusted Baseline</div>
-                        <div style="font-size: 1.1rem; font-weight: 700; color: #16A34A; margin-top: 4px;">● TRUSTED</div>
+                        <div style="font-size: 1.1rem; font-weight: 700; color: #16A34A; margin-top: 4px;">● {s1_status}</div>
                         <div style="font-size: 0.78rem; font-family: monospace; color: #334155; margin-top: 4px;">
-                            FP: {sim_data['stage1_baseline']['expected_fingerprint'][:16]}...
+                            FP: {s1_fp_disp}
                         </div>
                         <div style="font-size: 0.74rem; color: #64748B; margin-top: 4px;">5/5 Tools Cryptographically Pinned</div>
                     </div>
@@ -301,9 +362,9 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
                         <div style="font-size: 0.76rem; color: #64748B; font-weight: 700; text-transform: uppercase;">Stage 2: Tampering Applied</div>
                         <div style="font-size: 1.1rem; font-weight: 700; color: #DC2626; margin-top: 4px;">● MODIFIED FIXTURE</div>
                         <div style="font-size: 0.78rem; color: #334155; margin-top: 4px;">
-                            <b>Mode:</b> {sim_data['stage6_evidence']['tamper_mode']}
+                            <b>Mode:</b> {s6_mode}
                         </div>
-                        <div style="font-size: 0.74rem; color: #64748B; margin-top: 4px;">{sim_data['stage6_evidence']['tamper_description']}</div>
+                        <div style="font-size: 0.74rem; color: #64748B; margin-top: 4px;">{s6_desc}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -313,9 +374,9 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
                     f"""
                     <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 14px;">
                         <div style="font-size: 0.76rem; color: #64748B; font-weight: 700; text-transform: uppercase;">Stage 3: Sentinel Detection</div>
-                        <div style="font-size: 1.1rem; font-weight: 700; color: #DC2626; margin-top: 4px;">● DRIFT DETECTED</div>
+                        <div style="font-size: 1.1rem; font-weight: 700; color: #DC2626; margin-top: 4px;">● {s3_status}</div>
                         <div style="font-size: 0.78rem; font-family: monospace; color: #334155; margin-top: 4px;">
-                            FP: {sim_data['stage3_detection']['observed_fingerprint'][:16]}...
+                            FP: {s3_fp_disp}
                         </div>
                         <div style="font-size: 0.74rem; color: #DC2626; font-weight: 600; margin-top: 4px;">Fingerprint Mismatch Confirmed</div>
                     </div>
@@ -328,7 +389,18 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
             # ==================================================================
             # PROOF THAT PATIENT DATA WAS NOT ACCESSED (PART 8)
             # ==================================================================
-            proof = sim_data["stage5_observable_proof"]
+            proof = sim_data.get("stage5_observable_proof") or {}
+            handler_invoked = bool(proof.get("handler_invoked", False))
+            patient_record_returned = proof.get("patient_record_returned")
+            state_changed = bool(proof.get("state_changed", False))
+
+            s4 = sim_data.get("stage4_dispatch_result") or {}
+            s4_decision = str(s4.get("decision", "BLOCKED")).upper()
+            s4_rule = s4.get("rule", "registry verification failed")
+            s4_request_id = s4.get("request_id", "REQ-SIM-TAMPER")
+            s4_tool = s4.get("tool", "get_patient_record")
+            s4_reason = s4.get("reason", "Registry drift detected.")
+
             st.markdown(
                 f"""
                 <div style="background: #FFFFFF; border: 2px solid #0D9488; border-radius: 10px; padding: 18px; margin-bottom: 16px; box-shadow: 0 2px 6px rgba(13, 148, 136, 0.08);">
@@ -345,31 +417,31 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
                     <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;">
                         <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px; text-align: center;">
                             <div style="font-size: 0.72rem; color: #64748B; font-weight: 700; text-transform: uppercase;">Handler Invocation</div>
-                            <div style="font-size: 1.25rem; font-weight: 800; color: #16A34A; margin-top: 2px;">
-                                {'TRUE (LEAKED)' if proof['handler_invoked'] else 'FALSE (BLOCKED)'}
+                            <div style="font-size: 1.25rem; font-weight: 800; color: {'#DC2626' if handler_invoked else '#16A34A'}; margin-top: 2px;">
+                                {'TRUE (LEAKED)' if handler_invoked else 'FALSE (BLOCKED)'}
                             </div>
                             <div style="font-size: 0.7rem; color: #64748B;">0 Invocations Reached</div>
                         </div>
                         <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px; text-align: center;">
                             <div style="font-size: 0.72rem; color: #64748B; font-weight: 700; text-transform: uppercase;">Records Returned</div>
-                            <div style="font-size: 1.25rem; font-weight: 800; color: #16A34A; margin-top: 2px;">
-                                {'RETURNED' if proof['patient_record_returned'] else 'NONE (0 BYTES)'}
+                            <div style="font-size: 1.25rem; font-weight: 800; color: {'#DC2626' if patient_record_returned else '#16A34A'}; margin-top: 2px;">
+                                {'RETURNED' if patient_record_returned else 'NONE (0 BYTES)'}
                             </div>
                             <div style="font-size: 0.7rem; color: #64748B;">Zero Clinical Exposure</div>
                         </div>
                         <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px; text-align: center;">
                             <div style="font-size: 0.72rem; color: #64748B; font-weight: 700; text-transform: uppercase;">Backend State Changed</div>
-                            <div style="font-size: 1.25rem; font-weight: 800; color: #16A34A; margin-top: 2px;">
-                                {'TRUE' if proof['state_changed'] else 'FALSE'}
+                            <div style="font-size: 1.25rem; font-weight: 800; color: {'#DC2626' if state_changed else '#16A34A'}; margin-top: 2px;">
+                                {'TRUE' if state_changed else 'FALSE'}
                             </div>
                             <div style="font-size: 0.7rem; color: #64748B;">Database Records Unaltered</div>
                         </div>
                         <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px; text-align: center;">
                             <div style="font-size: 0.72rem; color: #64748B; font-weight: 700; text-transform: uppercase;">Security Enforcement</div>
                             <div style="font-size: 1.25rem; font-weight: 800; color: #DC2626; margin-top: 2px;">
-                                {sim_data['stage4_dispatch_result']['decision'].upper()}
+                                {s4_decision}
                             </div>
-                            <div style="font-size: 0.7rem; color: #64748B;">{sim_data['stage4_dispatch_result']['rule']}</div>
+                            <div style="font-size: 0.7rem; color: #64748B;">{s4_rule}</div>
                         </div>
                     </div>
                 </div>
@@ -381,14 +453,14 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
             dec_col1, dec_col2 = st.columns(2)
             with dec_col1:
                 st.markdown("##### 🛡️ Gateway Decision Telemetry")
-                st.markdown(f"- **Request ID:** `{sim_data['stage4_dispatch_result']['request_id']}`")
-                st.markdown(f"- **Operation Name:** `{sim_data['stage4_dispatch_result']['tool']}`")
-                st.markdown(f"- **Verdict:** <span class='badge-blocked'>BLOCKED</span>", unsafe_allow_html=True)
-                st.markdown(f"- **Security Rule:** `{sim_data['stage4_dispatch_result']['rule']}`")
-                st.markdown(f"- **Decision Reason:** {sim_data['stage4_dispatch_result']['reason']}")
+                st.markdown(f"- **Request ID:** `{s4_request_id}`")
+                st.markdown(f"- **Operation Name:** `{s4_tool}`")
+                st.markdown(f"- **Verdict:** <span class='badge-blocked'>{s4_decision}</span>", unsafe_allow_html=True)
+                st.markdown(f"- **Security Rule:** `{s4_rule}`")
+                st.markdown(f"- **Decision Reason:** {s4_reason}")
             with dec_col2:
                 st.markdown("##### 🔬 Detected Discrepancies")
-                diffs = sim_data["stage3_detection"].get("differences", [])
+                diffs = s3.get("differences", [])
                 if diffs:
                     for d in diffs:
                         st.markdown(f"- ⚠️ {d}")
@@ -402,28 +474,48 @@ def render_sentinel_console(all_events: List[Dict[str, Any]], to_ist_string: Cal
             res_col1, res_col2 = st.columns(2)
             with res_col1:
                 st.markdown("##### 🔄 Stage 7: Isolated Registry Restoration")
-                st.markdown(f"- **Restored Status:** <span class='badge-allowed'>● {sim_data['stage7_restoration']['status']}</span>", unsafe_allow_html=True)
-                st.markdown(f"- **Reverified SHA-256:** `{sim_data['stage7_restoration']['observed_fingerprint'][:24]}...`")
-                st.markdown(f"- **Fingerprints Match:** `{sim_data['stage7_restoration']['fingerprints_match']}`")
+                stage7 = sim_data.get("stage7_restoration") or {}
+                status7 = stage7.get("status", "UNKNOWN")
+                obs_fp7 = stage7.get("observed_fingerprint") or ""
+                obs_fp7_disp = f"{obs_fp7[:24]}..." if obs_fp7 else "Unavailable"
+
+                fps_match = safe_fingerprints_match(stage7)
+                badge_class = "badge-allowed" if str(status7).upper() == "TRUSTED" and fps_match else "badge-blocked"
+
+                st.markdown(f"- **Restored Status:** <span class='{badge_class}'>● {status7}</span>", unsafe_allow_html=True)
+                st.markdown(f"- **Reverified SHA-256:** `{obs_fp7_disp}`")
+                st.markdown(f"- **Fingerprints Match:** `{fps_match}`")
                 st.markdown("- **Registry State:** Baseline re-anchored. Ready for authorized execution.")
             with res_col2:
                 st.markdown("##### ✅ Stage 8: Authorized Resumption Outcome")
-                auth_d = sim_data["stage8_authorized_resumption"]
-                st.markdown(f"- **Authorized Verdict:** <span class='badge-allowed'>{auth_d['decision'].upper()}</span>", unsafe_allow_html=True)
-                st.markdown(f"- **Security Rule:** `{auth_d['rule']}`")
-                st.markdown(f"- **Handler Invoked:** `{auth_d['handler_invoked']}` *(Genuine Retrieval)*")
-                st.markdown(f"- **Retrieved Patient:** `{auth_d['data'].get('name_synthetic', 'Synthetic Patient')}`")
+                auth_d = sim_data.get("stage8_authorized_resumption") or {}
+                auth_decision = auth_d.get("decision", "UNKNOWN")
+                auth_rule = auth_d.get("rule", "Unknown")
+                auth_handler = bool(auth_d.get("handler_invoked", False))
+                auth_data = auth_d.get("data") or {}
+                retrieved_patient = auth_data.get("name_synthetic", "Synthetic Patient")
+                auth_badge = "badge-allowed" if str(auth_decision).lower() == "allowed" else "badge-blocked"
+
+                st.markdown(f"- **Authorized Verdict:** <span class='{auth_badge}'>{auth_decision.upper()}</span>", unsafe_allow_html=True)
+                st.markdown(f"- **Security Rule:** `{auth_rule}`")
+                st.markdown(f"- **Handler Invoked:** `{auth_handler}` *(Genuine Retrieval)*")
+                st.markdown(f"- **Retrieved Patient:** `{retrieved_patient}`")
 
         else:
             st.info("💡 Click **'⚡ Simulate MCP Tool Tampering'** above to launch the controlled hackathon jury demonstration.")
 
         # If user ran direct authorized resumption from button
         direct_auth = st.session_state.get("sentinel_authorized_result")
-        if direct_auth:
+        if direct_auth and isinstance(direct_auth, dict):
+            d_data = direct_auth.get("data") or {}
+            d_name = d_data.get("name_synthetic", "Synthetic Patient")
+            d_pid = d_data.get("patient_id", "Unknown")
+            d_decision = str(direct_auth.get("decision", "UNKNOWN")).upper()
+            d_rule = direct_auth.get("rule", "Unknown")
             st.success(
                 f"✅ **Authorized Clinical Call Succeeded on Verified Registry:** "
-                f"Retrieved `{direct_auth['data'].get('name_synthetic', 'Synthetic Patient')}` ({direct_auth['data'].get('patient_id')}) — "
-                f"Decision: `{direct_auth['decision'].upper()}` ({direct_auth['rule']})."
+                f"Retrieved `{d_name}` ({d_pid}) — "
+                f"Decision: `{d_decision}` ({d_rule})."
             )
 
     # ==========================================================================

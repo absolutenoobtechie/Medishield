@@ -126,6 +126,22 @@ def check_gateway_health() -> Dict[str, Any]:
                 "detail": "Cryptographic engine self-test failed",
             }
 
+        import os
+        from guard.approval import APPROVAL_SECRET_ENV, MIN_APPROVAL_SECRET_BYTES
+        secret_val = os.environ.get(APPROVAL_SECRET_ENV)
+        if not secret_val:
+            return {
+                "status": "DEGRADED",
+                "healthy": False,
+                "detail": f"{APPROVAL_SECRET_ENV} not set in environment (fail-closed gateway)",
+            }
+        if len(secret_val.encode("utf-8")) < MIN_APPROVAL_SECRET_BYTES:
+            return {
+                "status": "DEGRADED",
+                "healthy": False,
+                "detail": f"{APPROVAL_SECRET_ENV} must contain at least {MIN_APPROVAL_SECRET_BYTES} bytes",
+            }
+
         return {
             "status": "OPERATIONAL",
             "healthy": True,
@@ -1097,22 +1113,28 @@ if nav_choice == "Overview":
                     "duration": "30 days",
                 }
                 prot = ProtectedAction(**action_data)
-                h = action_hash(prot)
-                _setup_test_approval(conn, app_id, action_data)
-                req = ExecutionRequest(
-                    request_id=req_id,
-                    actor_id="agent_1",
-                    tool="update_order",
-                    approval_id=app_id,
-                    action=prot,
-                )
-                dec = verify_execution(req, conn)
-                conn.close()
+                try:
+                    _setup_test_approval(conn, app_id, action_data)
+                    req = ExecutionRequest(
+                        request_id=req_id,
+                        actor_id="agent_1",
+                        tool="update_order",
+                        approval_id=app_id,
+                        action=prot,
+                    )
+                    dec = verify_execution(req, conn)
+                    st.session_state["flash_banner"] = (
+                        "success",
+                        f"✅ Live Tool Call Executed: `{req_id}` -> ALLOWED ({dec.rule}). Order ORD-LIVE-001 updated in backend. Monitored calls counter incremented!",
+                    )
+                except Exception as exc:
+                    st.session_state["flash_banner"] = (
+                        "error",
+                        f"🛑 Live Action Execution Blocked: {exc}",
+                    )
+                finally:
+                    conn.close()
                 st.session_state["last_refresh_time"] = datetime.now(timezone.utc)
-                st.session_state["flash_banner"] = (
-                    "success",
-                    f"✅ Live Tool Call Executed: `{req_id}` -> ALLOWED ({dec.rule}). Order ORD-LIVE-001 updated in backend. Monitored calls counter incremented!",
-                )
                 st.rerun()
 
         with sim2:
@@ -1145,23 +1167,28 @@ if nav_choice == "Overview":
                 tampered_data = dict(approved_data)
                 tampered_data["dose"] = "50"
 
-                prot_app = ProtectedAction(**approved_data)
-                h = action_hash(prot_app)
-                _setup_test_approval(conn, app_id, approved_data)
-                req = ExecutionRequest(
-                    request_id=req_id,
-                    actor_id="agent_1",
-                    tool="update_order",
-                    approval_id=app_id,
-                    action=ProtectedAction(**tampered_data),
-                )
-                dec = verify_execution(req, conn)
-                conn.close()
+                try:
+                    _setup_test_approval(conn, app_id, approved_data)
+                    req = ExecutionRequest(
+                        request_id=req_id,
+                        actor_id="agent_1",
+                        tool="update_order",
+                        approval_id=app_id,
+                        action=ProtectedAction(**tampered_data),
+                    )
+                    dec = verify_execution(req, conn)
+                    st.session_state["flash_banner"] = (
+                        "error",
+                        f"🛑 Adversarial Attack Blocked: `{req_id}` -> BLOCKED ({dec.rule}). Safeguard engaged, backend unchanged, counter incremented!",
+                    )
+                except Exception as exc:
+                    st.session_state["flash_banner"] = (
+                        "error",
+                        f"🛑 Attack Simulation Blocked: {exc}",
+                    )
+                finally:
+                    conn.close()
                 st.session_state["last_refresh_time"] = datetime.now(timezone.utc)
-                st.session_state["flash_banner"] = (
-                    "error",
-                    f"🛑 Adversarial Attack Blocked: `{req_id}` -> BLOCKED ({dec.rule}). Safeguard engaged, backend unchanged, counter incremented!",
-                )
                 st.rerun()
 
         with sim3:
@@ -1179,25 +1206,31 @@ if nav_choice == "Overview":
             if st.button("⚠️ Execute Advisory Call", key="btn_sim_warn", use_container_width=True):
                 ts = int(datetime.now().timestamp())
                 req_id = f"REQ-LIVE-WARN-{ts}"
-                record_audit_event({
-                    "time": datetime.now(timezone.utc).isoformat(),
-                    "request_id": req_id,
-                    "actor_id": "agent_1",
-                    "tool": "update_order",
-                    "action_type": "medication_order",
-                    "approval_id": f"APR-LIVE-WARN-{ts}",
-                    "decision": "warning",
-                    "risk": "medium",
-                    "rule": "unit case normalization notice",
-                    "reason": "Submitted units 'MG' normalized to lowercase 'mg'. Approved action permitted under clinical oversight.",
-                    "changed_fields": ["units"],
-                    "state_changed": 1,
-                })
+                try:
+                    record_audit_event({
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "request_id": req_id,
+                        "actor": "agent_1",
+                        "tool": "update_order",
+                        "action_type": "medication_order",
+                        "approval_id": f"APR-LIVE-WARN-{ts}",
+                        "decision": "warning",
+                        "risk": "medium",
+                        "rule": "unit case normalization notice",
+                        "reason": "Submitted units 'MG' normalized to lowercase 'mg'. Approved action permitted under clinical oversight.",
+                        "changed_fields": ["units"],
+                        "state_changed": True,
+                    })
+                    st.session_state["flash_banner"] = (
+                        "warning",
+                        f"⚠️ Policy Advisory Audited: `{req_id}` -> WARNING. Gateway normalized casing, audit recorded, counter incremented!",
+                    )
+                except Exception as exc:
+                    st.session_state["flash_banner"] = (
+                        "error",
+                        f"🛑 Advisory Event Logging Blocked: {exc}",
+                    )
                 st.session_state["last_refresh_time"] = datetime.now(timezone.utc)
-                st.session_state["flash_banner"] = (
-                    "warning",
-                    f"⚠️ Policy Advisory Audited: `{req_id}` -> WARNING. Gateway normalized casing, audit recorded, counter incremented!",
-                )
                 st.rerun()
 
     # Recent Security Events Section (White Panel Card)
@@ -1277,64 +1310,68 @@ elif nav_choice == "Security Test Lab":
         st.caption("Description: A clinician approved 5mg of MED-A, but an untrusted agent submits 50mg.")
 
         conn = get_connection(APP_DB_PATH)
-        approved_action = {
-            "order_id": "ORD-DEMO-001",
-            "patient_id": "P-104",
-            "medication_id": "MED-A",
-            "dose": "5",
-            "units": "mg",
-            "route": "oral",
-            "frequency": "daily",
-            "duration": "7 days",
-        }
-        app_id = "APR-TEST-TAMPER-01"
-        _setup_test_approval(conn, app_id, approved_action)
+        try:
+            approved_action = {
+                "order_id": "ORD-DEMO-001",
+                "patient_id": "P-104",
+                "medication_id": "MED-A",
+                "dose": "5",
+                "units": "mg",
+                "route": "oral",
+                "frequency": "daily",
+                "duration": "7 days",
+            }
+            app_id = "APR-TEST-TAMPER-01"
+            _setup_test_approval(conn, app_id, approved_action)
 
-        orig_order = conn.execute("SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'").fetchone()
-        orig_dose = orig_order["dose"] if orig_order else "5"
+            orig_order = conn.execute("SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'").fetchone()
+            orig_dose = orig_order["dose"] if orig_order else "5"
 
-        req_id = f"REQ-TAMPER-{int(datetime.now().timestamp())}"
-        tampered_action = dict(approved_action, dose="50")
-        exec_req = ExecutionRequest(
-            request_id=req_id,
-            actor_id="agent_1",
-            tool="update_order",
-            approval_id=app_id,
-            action=ProtectedAction(**tampered_action),
-        )
+            req_id = f"REQ-TAMPER-{int(datetime.now().timestamp())}"
+            tampered_action = dict(approved_action, dose="50")
+            exec_req = ExecutionRequest(
+                request_id=req_id,
+                actor_id="agent_1",
+                tool="update_order",
+                approval_id=app_id,
+                action=ProtectedAction(**tampered_action),
+            )
 
-        decision = verify_execution(exec_req, conn)
+            decision = verify_execution(exec_req, conn)
 
-        post_order = conn.execute("SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'").fetchone()
-        post_dose = post_order["dose"] if post_order else "5"
-        conn.close()
+            post_order = conn.execute("SELECT dose FROM orders WHERE order_id = 'ORD-DEMO-001'").fetchone()
+            post_dose = post_order["dose"] if post_order else "5"
 
-        is_pass = (
-            decision.decision == "blocked"
-            and decision.rule == "intent hash mismatch"
-            and decision.state_changed is False
-            and orig_dose == post_dose
-        )
+            is_pass = (
+                decision.decision == "blocked"
+                and decision.rule == "intent hash mismatch"
+                and decision.state_changed is False
+                and orig_dose == post_dose
+            )
 
-        t1_col1, t1_col2 = st.columns(2)
-        with t1_col1:
-            st.markdown(f"**Expected Result:** <span class='badge-blocked'>BLOCKED</span> *(intent hash mismatch)*", unsafe_allow_html=True)
-            st.markdown(f"**Actual Result:** <span class='badge-blocked'>{decision.decision.upper()}</span>", unsafe_allow_html=True)
-            st.markdown(f"**Security Rule:** `{decision.rule}`")
-            st.markdown(f"**Clinical Reason:** {decision.reason}")
-            st.markdown(f"**Request ID:** `{req_id}`")
-        with t1_col2:
-            st.markdown("**Protected Backend State Verification:**")
-            st.markdown(f"- Clinician Approved Dose: `5 mg`")
-            st.markdown(f"- Agent Submitted Dose: `50 mg` *(Tampered)*")
-            st.markdown(f"- Database Dose Prior to Attack: `{orig_dose}`")
-            st.markdown(f"- Database Dose After Attack: `{post_dose}`")
-            st.markdown(f"- Backend State Modified: `{decision.state_changed}`")
+            t1_col1, t1_col2 = st.columns(2)
+            with t1_col1:
+                st.markdown(f"**Expected Result:** <span class='badge-blocked'>BLOCKED</span> *(intent hash mismatch)*", unsafe_allow_html=True)
+                st.markdown(f"**Actual Result:** <span class='badge-blocked'>{decision.decision.upper()}</span>", unsafe_allow_html=True)
+                st.markdown(f"**Security Rule:** `{decision.rule}`")
+                st.markdown(f"**Clinical Reason:** {decision.reason}")
+                st.markdown(f"**Request ID:** `{req_id}`")
+            with t1_col2:
+                st.markdown("**Protected Backend State Verification:**")
+                st.markdown(f"- Clinician Approved Dose: `5 mg`")
+                st.markdown(f"- Agent Submitted Dose: `50 mg` *(Tampered)*")
+                st.markdown(f"- Database Dose Prior to Attack: `{orig_dose}`")
+                st.markdown(f"- Database Dose After Attack: `{post_dose}`")
+                st.markdown(f"- Backend State Modified: `{decision.state_changed}`")
 
-        if is_pass:
-            st.success("✅ **PASS:** Dose tampering blocked fail-closed. Database records remained completely unmodified.")
-        else:
-            st.error("❌ **FAIL:** Attack modified backend state!")
+            if is_pass:
+                st.success("✅ **PASS:** Dose tampering blocked fail-closed. Database records remained completely unmodified.")
+            else:
+                st.error("❌ **FAIL:** Attack modified backend state!")
+        except Exception as exc:
+            st.error(f"❌ **Test 1 Failed to Execute:** {exc}")
+        finally:
+            conn.close()
 
     # Test 2: Patient Substitution
     if run_patient or run_all:
@@ -1343,57 +1380,61 @@ elif nav_choice == "Security Test Lab":
         st.caption("Description: A clinician approved an order for Patient P-104; an agent attempts to apply it to P-205.")
 
         conn = get_connection(APP_DB_PATH)
-        approved_action = {
-            "order_id": "ORD-DEMO-001",
-            "patient_id": "P-104",
-            "medication_id": "MED-A",
-            "dose": "5",
-            "units": "mg",
-            "route": "oral",
-            "frequency": "daily",
-            "duration": "7 days",
-        }
-        app_id = "APR-TEST-SUBST-01"
-        _setup_test_approval(conn, app_id, approved_action)
+        try:
+            approved_action = {
+                "order_id": "ORD-DEMO-001",
+                "patient_id": "P-104",
+                "medication_id": "MED-A",
+                "dose": "5",
+                "units": "mg",
+                "route": "oral",
+                "frequency": "daily",
+                "duration": "7 days",
+            }
+            app_id = "APR-TEST-SUBST-01"
+            _setup_test_approval(conn, app_id, approved_action)
 
-        req_id = f"REQ-SUBST-{int(datetime.now().timestamp())}"
-        substituted_action = dict(approved_action, patient_id="P-205")
-        exec_req = ExecutionRequest(
-            request_id=req_id,
-            actor_id="agent_1",
-            tool="update_order",
-            approval_id=app_id,
-            action=ProtectedAction(**substituted_action),
-        )
+            req_id = f"REQ-SUBST-{int(datetime.now().timestamp())}"
+            substituted_action = dict(approved_action, patient_id="P-205")
+            exec_req = ExecutionRequest(
+                request_id=req_id,
+                actor_id="agent_1",
+                tool="update_order",
+                approval_id=app_id,
+                action=ProtectedAction(**substituted_action),
+            )
 
-        decision = verify_execution(exec_req, conn)
-        conn.close()
+            decision = verify_execution(exec_req, conn)
 
-        is_pass = (
-            decision.decision == "blocked"
-            and decision.rule == "intent hash mismatch"
-            and decision.state_changed is False
-            and "patient_id" in decision.changed_fields
-        )
+            is_pass = (
+                decision.decision == "blocked"
+                and decision.rule == "intent hash mismatch"
+                and decision.state_changed is False
+                and "patient_id" in decision.changed_fields
+            )
 
-        t2_col1, t2_col2 = st.columns(2)
-        with t2_col1:
-            st.markdown(f"**Expected Result:** <span class='badge-blocked'>BLOCKED</span> *(intent hash mismatch)*", unsafe_allow_html=True)
-            st.markdown(f"**Actual Result:** <span class='badge-blocked'>{decision.decision.upper()}</span>", unsafe_allow_html=True)
-            st.markdown(f"**Security Rule:** `{decision.rule}`")
-            st.markdown(f"**Clinical Reason:** {decision.reason}")
-            st.markdown(f"**Request ID:** `{req_id}`")
-        with t2_col2:
-            st.markdown("**Protected Backend State Verification:**")
-            st.markdown("- Clinician Approved Patient: `P-104`")
-            st.markdown("- Agent Submitted Patient: `P-205` *(Unauthorized Transfer)*")
-            st.markdown(f"- Detected Mismatched Fields: `{decision.changed_fields}`")
-            st.markdown(f"- Backend State Modified: `{decision.state_changed}`")
+            t2_col1, t2_col2 = st.columns(2)
+            with t2_col1:
+                st.markdown(f"**Expected Result:** <span class='badge-blocked'>BLOCKED</span> *(intent hash mismatch)*", unsafe_allow_html=True)
+                st.markdown(f"**Actual Result:** <span class='badge-blocked'>{decision.decision.upper()}</span>", unsafe_allow_html=True)
+                st.markdown(f"**Security Rule:** `{decision.rule}`")
+                st.markdown(f"**Clinical Reason:** {decision.reason}")
+                st.markdown(f"**Request ID:** `{req_id}`")
+            with t2_col2:
+                st.markdown("**Protected Backend State Verification:**")
+                st.markdown("- Clinician Approved Patient: `P-104`")
+                st.markdown("- Agent Submitted Patient: `P-205` *(Unauthorized Transfer)*")
+                st.markdown(f"- Detected Mismatched Fields: `{decision.changed_fields}`")
+                st.markdown(f"- Backend State Modified: `{decision.state_changed}`")
 
-        if is_pass:
-            st.success("✅ **PASS:** Patient substitution blocked. Intent lock bound action strictly to Patient P-104.")
-        else:
-            st.error("❌ **FAIL:** Patient substitution succeeded!")
+            if is_pass:
+                st.success("✅ **PASS:** Patient substitution blocked. Intent lock bound action strictly to Patient P-104.")
+            else:
+                st.error("❌ **FAIL:** Patient substitution succeeded!")
+        except Exception as exc:
+            st.error(f"❌ **Test 2 Failed to Execute:** {exc}")
+        finally:
+            conn.close()
 
     # Test 3: Approval Replay
     if run_replay or run_all:
@@ -1402,67 +1443,71 @@ elif nav_choice == "Security Test Lab":
         st.caption("Description: A legitimate approval is executed once, then replayed a second time using the consumed token.")
 
         conn = get_connection(APP_DB_PATH)
-        action_data = {
-            "order_id": "ORD-DEMO-001",
-            "patient_id": "P-104",
-            "medication_id": "MED-A",
-            "dose": "5",
-            "units": "mg",
-            "route": "oral",
-            "frequency": "daily",
-            "duration": "7 days",
-        }
-        app_id = "APR-TEST-REPLAY-01"
-        _setup_test_approval(conn, app_id, action_data)
+        try:
+            action_data = {
+                "order_id": "ORD-DEMO-001",
+                "patient_id": "P-104",
+                "medication_id": "MED-A",
+                "dose": "5",
+                "units": "mg",
+                "route": "oral",
+                "frequency": "daily",
+                "duration": "7 days",
+            }
+            app_id = "APR-TEST-REPLAY-01"
+            _setup_test_approval(conn, app_id, action_data)
 
-        # Call 1: Legitimate
-        req1_id = f"REQ-LEGIT-{int(datetime.now().timestamp())}"
-        req1 = ExecutionRequest(
-            request_id=req1_id,
-            actor_id="agent_1",
-            tool="update_order",
-            approval_id=app_id,
-            action=ProtectedAction(**action_data),
-        )
-        dec1 = verify_execution(req1, conn)
+            # Call 1: Legitimate
+            req1_id = f"REQ-LEGIT-{int(datetime.now().timestamp())}"
+            req1 = ExecutionRequest(
+                request_id=req1_id,
+                actor_id="agent_1",
+                tool="update_order",
+                approval_id=app_id,
+                action=ProtectedAction(**action_data),
+            )
+            dec1 = verify_execution(req1, conn)
 
-        # Call 2: Replay
-        req2_id = f"REQ-REPLAY-{int(datetime.now().timestamp())}"
-        req2 = ExecutionRequest(
-            request_id=req2_id,
-            actor_id="agent_1",
-            tool="update_order",
-            approval_id=app_id,
-            action=ProtectedAction(**action_data),
-        )
-        dec2 = verify_execution(req2, conn)
-        conn.close()
+            # Call 2: Replay
+            req2_id = f"REQ-REPLAY-{int(datetime.now().timestamp())}"
+            req2 = ExecutionRequest(
+                request_id=req2_id,
+                actor_id="agent_1",
+                tool="update_order",
+                approval_id=app_id,
+                action=ProtectedAction(**action_data),
+            )
+            dec2 = verify_execution(req2, conn)
 
-        is_pass = (
-            dec1.decision == "allowed"
-            and dec2.decision == "blocked"
-            and dec2.rule == "approval already consumed"
-            and dec2.state_changed is False
-        )
+            is_pass = (
+                dec1.decision == "allowed"
+                and dec2.decision == "blocked"
+                and dec2.rule == "approval already consumed"
+                and dec2.state_changed is False
+            )
 
-        t3_col1, t3_col2 = st.columns(2)
-        with t3_col1:
-            st.markdown(f"**Execution 1 (Legitimate):** <span class='badge-allowed'>{dec1.decision.upper()}</span>", unsafe_allow_html=True)
-            st.markdown(f"- Request ID: `{req1_id}`")
-            st.markdown(f"- Rule Triggered: `{dec1.rule}`")
-            st.markdown(f"- State Modified: `{dec1.state_changed}`")
-            st.markdown("- Approval Token: *Atomically Consumed*")
-        with t3_col2:
-            st.markdown(f"**Execution 2 (Replay Attack):** <span class='badge-blocked'>{dec2.decision.upper()}</span>", unsafe_allow_html=True)
-            st.markdown(f"- Request ID: `{req2_id}`")
-            st.markdown(f"- Rule Triggered: `{dec2.rule}`")
-            st.markdown(f"- Reason: {dec2.reason}")
-            st.markdown(f"- State Modified: `{dec2.state_changed}` *(Protected)*")
+            t3_col1, t3_col2 = st.columns(2)
+            with t3_col1:
+                st.markdown(f"**Execution 1 (Legitimate):** <span class='badge-allowed'>{dec1.decision.upper()}</span>", unsafe_allow_html=True)
+                st.markdown(f"- Request ID: `{req1_id}`")
+                st.markdown(f"- Rule Triggered: `{dec1.rule}`")
+                st.markdown(f"- State Modified: `{dec1.state_changed}`")
+                st.markdown("- Approval Token: *Atomically Consumed*")
+            with t3_col2:
+                st.markdown(f"**Execution 2 (Replay Attack):** <span class='badge-blocked'>{dec2.decision.upper()}</span>", unsafe_allow_html=True)
+                st.markdown(f"- Request ID: `{req2_id}`")
+                st.markdown(f"- Rule Triggered: `{dec2.rule}`")
+                st.markdown(f"- Reason: {dec2.reason}")
+                st.markdown(f"- State Modified: `{dec2.state_changed}` *(Protected)*")
 
-        if is_pass:
-            st.success("✅ **PASS:** Approval replay blocked. Single-use token invalidated immediately upon first execution.")
-        else:
-            st.error("❌ **FAIL:** Replay token executed twice!")
+            if is_pass:
+                st.success("✅ **PASS:** Approval replay blocked. Single-use token invalidated immediately upon first execution.")
+            else:
+                st.error("❌ **FAIL:** Replay token executed twice!")
+        except Exception as exc:
+            st.error(f"❌ **Test 3 Failed to Execute:** {exc}")
+        finally:
+            conn.close()
 
     # Test 4: Expired Approval
     if run_expired or run_all:
@@ -1471,62 +1516,63 @@ elif nav_choice == "Security Test Lab":
         st.caption("Description: Agent attempts to execute an action using an approval token whose validity period has elapsed.")
 
         conn = get_connection(APP_DB_PATH)
-        action_data = {
-            "order_id": "ORD-DEMO-001",
-            "patient_id": "P-104",
-            "medication_id": "MED-A",
-            "dose": "5",
-            "units": "mg",
-            "route": "oral",
-            "frequency": "daily",
-            "duration": "7 days",
-        }
-        app_id = "APR-TEST-EXPIRED-01"
-        prot = ProtectedAction(**action_data)
-        h = action_hash(prot)
-        # Seed an expired approval (expired in 2020) through the same
-        # authenticated fixture helper used by the other dashboard scenarios.
-        _setup_test_approval(
-            conn,
-            app_id,
-            action_data,
-            created_at="2019-12-01T00:00:00Z",
-            expires_at="2020-01-01T00:00:00Z",
-        )
+        try:
+            action_data = {
+                "order_id": "ORD-DEMO-001",
+                "patient_id": "P-104",
+                "medication_id": "MED-A",
+                "dose": "5",
+                "units": "mg",
+                "route": "oral",
+                "frequency": "daily",
+                "duration": "7 days",
+            }
+            app_id = "APR-TEST-EXPIRED-01"
+            prot = ProtectedAction(**action_data)
+            _setup_test_approval(
+                conn,
+                app_id,
+                action_data,
+                created_at="2019-12-01T00:00:00Z",
+                expires_at="2020-01-01T00:00:00Z",
+            )
 
-        req_id = f"REQ-EXPIRED-{int(datetime.now().timestamp())}"
-        exec_req = ExecutionRequest(
-            request_id=req_id,
-            actor_id="agent_1",
-            tool="update_order",
-            approval_id=app_id,
-            action=prot,
-        )
-        decision = verify_execution(exec_req, conn)
-        conn.close()
+            req_id = f"REQ-EXPIRED-{int(datetime.now().timestamp())}"
+            exec_req = ExecutionRequest(
+                request_id=req_id,
+                actor_id="agent_1",
+                tool="update_order",
+                approval_id=app_id,
+                action=prot,
+            )
+            decision = verify_execution(exec_req, conn)
 
-        is_pass = (
-            decision.decision == "blocked"
-            and decision.rule == "approval expired"
-            and decision.state_changed is False
-        )
+            is_pass = (
+                decision.decision == "blocked"
+                and decision.rule == "approval expired"
+                and decision.state_changed is False
+            )
 
-        t4_col1, t4_col2 = st.columns(2)
-        with t4_col1:
-            st.markdown(f"**Expected Result:** <span class='badge-blocked'>BLOCKED</span> *(approval expired)*", unsafe_allow_html=True)
-            st.markdown(f"**Actual Result:** <span class='badge-blocked'>{decision.decision.upper()}</span>", unsafe_allow_html=True)
-            st.markdown(f"**Security Rule:** `{decision.rule}`")
-            st.markdown(f"**Reason:** {decision.reason}")
-        with t4_col2:
-            st.markdown("**Protected State Verification:**")
-            st.markdown("- Approval Expiry Date: `2020-01-01T00:00:00Z` *(Expired)*")
-            st.markdown(f"- Request ID: `{req_id}`")
-            st.markdown(f"- Backend State Modified: `{decision.state_changed}`")
+            t4_col1, t4_col2 = st.columns(2)
+            with t4_col1:
+                st.markdown(f"**Expected Result:** <span class='badge-blocked'>BLOCKED</span> *(approval expired)*", unsafe_allow_html=True)
+                st.markdown(f"**Actual Result:** <span class='badge-blocked'>{decision.decision.upper()}</span>", unsafe_allow_html=True)
+                st.markdown(f"**Security Rule:** `{decision.rule}`")
+                st.markdown(f"**Reason:** {decision.reason}")
+            with t4_col2:
+                st.markdown("**Protected State Verification:**")
+                st.markdown("- Approval Expiry Date: `2020-01-01T00:00:00Z` *(Expired)*")
+                st.markdown(f"- Request ID: `{req_id}`")
+                st.markdown(f"- Backend State Modified: `{decision.state_changed}`")
 
-        if is_pass:
-            st.success("✅ **PASS:** Expired approval blocked fail-closed. Stale authorization cannot be executed.")
-        else:
-            st.error("❌ **FAIL:** Expired approval was accepted!")
+            if is_pass:
+                st.success("✅ **PASS:** Expired approval blocked fail-closed. Stale authorization cannot be executed.")
+            else:
+                st.error("❌ **FAIL:** Expired approval was accepted!")
+        except Exception as exc:
+            st.error(f"❌ **Test 4 Failed to Execute:** {exc}")
+        finally:
+            conn.close()
 
 
 # ------------------------------------------------------------------------------
@@ -1632,25 +1678,25 @@ elif nav_choice == "Approval Verification":
 
     with verif_col1:
         st.markdown("#### 📋 Clinician Approved Action")
-        app_patient = st.text_input("Approved Patient ID", value=st.session_state.get("v_app_patient", base_patient), key="v_app_patient")
-        app_med = st.text_input("Approved Medication ID", value=st.session_state.get("v_app_med", base_med), key="v_app_med")
-        app_dose = st.text_input("Approved Dose", value=st.session_state.get("v_app_dose", base_dose), key="v_app_dose")
-        app_units = st.text_input("Approved Units", value=st.session_state.get("v_app_units", base_units), key="v_app_units")
-        app_route = st.text_input("Approved Route", value=st.session_state.get("v_app_route", base_route), key="v_app_route")
-        app_freq = st.text_input("Approved Frequency", value=st.session_state.get("v_app_freq", base_freq), key="v_app_freq")
-        app_dur = st.text_input("Approved Duration", value=st.session_state.get("v_app_dur", base_dur), key="v_app_dur")
-        app_order = st.text_input("Approved Order ID", value=st.session_state.get("v_app_order", base_order), key="v_app_order")
+        app_patient = st.text_input("Approved Patient ID", key="v_app_patient")
+        app_med = st.text_input("Approved Medication ID", key="v_app_med")
+        app_dose = st.text_input("Approved Dose", key="v_app_dose")
+        app_units = st.text_input("Approved Units", key="v_app_units")
+        app_route = st.text_input("Approved Route", key="v_app_route")
+        app_freq = st.text_input("Approved Frequency", key="v_app_freq")
+        app_dur = st.text_input("Approved Duration", key="v_app_dur")
+        app_order = st.text_input("Approved Order ID", key="v_app_order")
 
     with verif_col2:
         st.markdown("#### 🤖 Agent Submitted Action")
-        sub_patient = st.text_input("Submitted Patient ID", value=st.session_state.get("v_sub_patient", base_patient), key="v_sub_patient")
-        sub_med = st.text_input("Submitted Medication ID", value=st.session_state.get("v_sub_med", base_med), key="v_sub_med")
-        sub_dose = st.text_input("Submitted Dose", value=st.session_state.get("v_sub_dose", base_dose), key="v_sub_dose")
-        sub_units = st.text_input("Submitted Units", value=st.session_state.get("v_sub_units", base_units), key="v_sub_units")
-        sub_route = st.text_input("Submitted Route", value=st.session_state.get("v_sub_route", base_route), key="v_sub_route")
-        sub_freq = st.text_input("Submitted Frequency", value=st.session_state.get("v_sub_freq", base_freq), key="v_sub_freq")
-        sub_dur = st.text_input("Submitted Duration", value=st.session_state.get("v_sub_dur", base_dur), key="v_sub_dur")
-        sub_order = st.text_input("Submitted Order ID", value=st.session_state.get("v_sub_order", base_order), key="v_sub_order")
+        sub_patient = st.text_input("Submitted Patient ID", key="v_sub_patient")
+        sub_med = st.text_input("Submitted Medication ID", key="v_sub_med")
+        sub_dose = st.text_input("Submitted Dose", key="v_sub_dose")
+        sub_units = st.text_input("Submitted Units", key="v_sub_units")
+        sub_route = st.text_input("Submitted Route", key="v_sub_route")
+        sub_freq = st.text_input("Submitted Frequency", key="v_sub_freq")
+        sub_dur = st.text_input("Submitted Duration", key="v_sub_dur")
+        sub_order = st.text_input("Submitted Order ID", key="v_sub_order")
 
     st.markdown("")
     run_check = st.button("🔒 Run Gateway Intent Lock Check", type="primary", use_container_width=True)
@@ -1745,23 +1791,24 @@ elif nav_choice == "Approval Verification":
             conn = get_connection(APP_DB_PATH)
             ts = int(datetime.now().timestamp())
             app_id = f"APR-ACTION-VERIF-{ts}"
-            _setup_test_approval(conn, app_id, approved_dict)
-
-            exec_req = ExecutionRequest(
-                request_id=f"REQ-ACTION-VERIF-{ts}",
-                actor_id="agent_1",
-                tool="update_order",
-                approval_id=app_id,
-                action=ProtectedAction(**submitted_dict),
-            )
+            req_id = f"REQ-ACTION-VERIF-{ts}"
             try:
+                _setup_test_approval(conn, app_id, approved_dict)
+                exec_req = ExecutionRequest(
+                    request_id=req_id,
+                    actor_id="agent_1",
+                    tool="update_order",
+                    approval_id=app_id,
+                    action=ProtectedAction(**submitted_dict),
+                )
                 live_decision = verify_execution(exec_req, conn)
             except Exception as exc:
                 verification_error = exc
-            conn.close()
+            finally:
+                conn.close()
             live_verdict = gateway_verdict(live_decision, verification_error)
             st.info(
-                f"⚡ **Live Gateway Result:** Recorded `{exec_req.request_id}` — "
+                f"⚡ **Live Gateway Result:** Recorded `{req_id}` — "
                 f"Decision: `{live_verdict['label']}` ({live_verdict['rule']})."
             )
 

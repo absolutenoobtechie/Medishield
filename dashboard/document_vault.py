@@ -112,6 +112,7 @@ def render_document_vault(*, db_path: Path, storage_root: Path) -> None:
                         except (AuthorizationError, LookupError) as exc:
                             st.error(f"Verification blocked: {exc}")
                 with col2:
+                    retrieval_key = f"vault_retrieved_{selected_id}_{variant}"
                     if st.button("Retrieve approved content"):
                         try:
                             content = retrieve_document(
@@ -121,14 +122,18 @@ def render_document_vault(*, db_path: Path, storage_root: Path) -> None:
                                 variant=variant,
                                 storage_root=storage_root,
                             )
-                            st.download_button(
-                                "Download verified content",
-                                data=content,
-                                file_name=f"{selected_id}.{variant}.bin",
-                                mime="application/octet-stream",
-                            )
+                            st.session_state[retrieval_key] = content
                             st.success("Gateway-authorized retrieval completed after authentication and hash verification.")
                         except (AuthorizationError, DocumentIntegrityError, DocumentValidationError, StorageConfigurationError) as exc:
+                            st.session_state.pop(retrieval_key, None)
                             st.error(f"Retrieval blocked: {exc}")
+
+                    if retrieval_key in st.session_state:
+                        st.download_button(
+                            "Download verified content",
+                            data=st.session_state[retrieval_key],
+                            file_name=f"{selected_id}.{variant}.bin",
+                            mime="application/octet-stream",
+                        )
     finally:
         connection.close()

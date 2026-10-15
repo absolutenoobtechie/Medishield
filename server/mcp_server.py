@@ -687,11 +687,7 @@ def dispatch_mcp_tool_call(
         registry_reason = sentinel_result.explanation
         registry_expected_fingerprint = sentinel_result.expected_fingerprint
         registry_observed_fingerprint = sentinel_result.observed_fingerprint
-        registry_fingerprints_match = (
-            registry_expected_fingerprint is not None
-            and registry_observed_fingerprint is not None
-            and registry_expected_fingerprint == registry_observed_fingerprint
-        )
+        registry_fingerprints_match = sentinel_result.fingerprints_match
         registry_differences = sentinel_result.differences
     else:
         # The override is dependency injection for the synthetic tampering

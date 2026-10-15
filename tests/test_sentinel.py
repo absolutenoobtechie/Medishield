@@ -80,6 +80,8 @@ def test_current_registry_is_trusted():
     assert result.status == "trusted"
     assert result.protected_execution_allowed is True
     assert result.expected_fingerprint == result.observed_fingerprint
+    assert result.fingerprints_match is True
+    assert result.to_dict()["fingerprints_match"] is True
     assert result.differences == []
 
 
@@ -102,6 +104,8 @@ def test_output_schema_fingerprint_is_deterministic_and_detects_tampering():
     assert sentinel.registry_fingerprint(tampered) != sentinel.registry_fingerprint(registry)
     assert result.status == "drift"
     assert result.protected_execution_allowed is False
+    assert result.fingerprints_match is False
+    assert result.to_dict()["fingerprints_match"] is False
     assert "changed output schema: get_patient_record" in result.differences
     assert "changed output schema: get_patient_record" in result.explanation
 

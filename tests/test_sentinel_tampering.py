@@ -17,6 +17,7 @@ from guard.forensics import get_forensic_events
 from guard.sentinel import (
     EXPECTED_REGISTRY_FINGERPRINT,
     TRUSTED_MCP_TOOLS,
+    check_registry,
     compute_registry_fingerprint,
     get_trusted_baseline_tools,
     verify_registry,
@@ -150,11 +151,13 @@ def test_complete_tool_registry_tampering_simulation():
     assert res["success"] is True
     assert res["stage1_baseline"]["status"] == "TRUSTED"
     assert res["stage3_detection"]["status"] == "DRIFT DETECTED"
+    assert res["stage3_detection"]["fingerprints_match"] is False
     assert res["stage4_dispatch_result"]["decision"] == "blocked"
     assert res["stage5_observable_proof"]["handler_invoked"] is False
     assert res["stage5_observable_proof"]["patient_record_returned"] is None
     assert res["stage5_observable_proof"]["data_leakage_prevented"] is True
     assert res["stage7_restoration"]["status"] == "TRUSTED"
+    assert res["stage7_restoration"]["fingerprints_match"] is True
     assert res["stage8_authorized_resumption"]["decision"] == "allowed"
 
 
@@ -167,3 +170,140 @@ def test_forensics_retrieval(memory_db):
     allowed_records = get_forensic_events(connection=memory_db, limit=20, decision_filter="allowed")
     for r in allowed_records:
         assert r.decision == "allowed"
+
+
+def test_sentinel_check_registry_populates_fingerprints_match():
+    """Verify check_registry populates fingerprints_match on TrustResult and in to_dict."""
+    clean = check_registry()
+    assert clean.status == "trusted"
+    assert clean.fingerprints_match is True
+    assert clean.to_dict()["fingerprints_match"] is True
+
+    tampered = get_trusted_baseline_tools()
+    tampered[0]["name"] = "get_patient_record_tampered"
+    drift = check_registry(tampered)
+    assert drift.status == "drift"
+    assert drift.fingerprints_match is False
+    assert drift.to_dict()["fingerprints_match"] is False
+
+
+def test_dashboard_safe_fingerprints_match_handles_legacy_and_missing_data():
+    """Verify safe_fingerprints_match fail-closed semantics with legacy, missing, and invalid data."""
+    from dashboard.sentinel_view import safe_fingerprints_match
+
+    fp = "a" * 64
+    fp_diff = "b" * 64
+
+    # 1. Legacy data with matching hashes and trusted status (missing fingerprints_match key)
+    legacy_trusted = {
+        "status": "TRUSTED",
+        "expected_fingerprint": fp,
+        "observed_fingerprint": fp,
+        "protected_execution_allowed": True,
+    }
+    assert safe_fingerprints_match(legacy_trusted) is True
+
+    # 2. Legacy data where hashes mismatch
+    legacy_mismatch = {
+        "status": "TRUSTED",
+        "expected_fingerprint": fp,
+        "observed_fingerprint": fp_diff,
+        "protected_execution_allowed": True,
+    }
+    assert safe_fingerprints_match(legacy_mismatch) is False
+
+    # 3. Legacy data where fingerprints are missing or empty
+    legacy_no_fps = {
+        "status": "TRUSTED",
+        "expected_fingerprint": None,
+        "observed_fingerprint": None,
+    }
+    assert safe_fingerprints_match(legacy_no_fps) is False
+
+    # 4. Status indicates drift or failure (even if hashes match)
+    drift_status = {
+        "status": "DRIFT DETECTED",
+        "expected_fingerprint": fp,
+        "observed_fingerprint": fp,
+    }
+    assert safe_fingerprints_match(drift_status) is False
+
+    # 5. Explicit fingerprints_match is False
+    explicit_false = {
+        "status": "TRUSTED",
+        "expected_fingerprint": fp,
+        "observed_fingerprint": fp,
+        "fingerprints_match": False,
+    }
+    assert safe_fingerprints_match(explicit_false) is False
+
+    # 6. Explicit fingerprints_match is True but hashes mismatch (never report success unless verified)
+    spoofed_true = {
+        "status": "TRUSTED",
+        "expected_fingerprint": fp,
+        "observed_fingerprint": fp_diff,
+        "fingerprints_match": True,
+    }
+    assert safe_fingerprints_match(spoofed_true) is False
+
+    # 7. Non-dict or None
+    assert safe_fingerprints_match(None) is False
+    assert safe_fingerprints_match({}) is False
+    assert safe_fingerprints_match("TRUSTED") is False
+
+
+def test_dashboard_render_sentinel_console_with_missing_fingerprints_match():
+    """Regression test: verify render_sentinel_console does not crash when fingerprints_match is missing."""
+    from unittest.mock import MagicMock, patch
+    from dashboard.sentinel_view import render_sentinel_console
+
+    # Run the tampering demo and explicitly delete fingerprints_match to simulate legacy or missing data
+    res = tool_registry_tampering(tamper_mode="rename_tool", patient_id="P-101")
+    if "fingerprints_match" in res["stage7_restoration"]:
+        del res["stage7_restoration"]["fingerprints_match"]
+
+    mock_st = MagicMock()
+    mock_st.button.return_value = False
+    mock_st.number_input.return_value = 50
+    mock_st.selectbox.return_value = "All"
+    mock_st.session_state = {
+        "last_refresh_time": None,
+        "sentinel_tamper_result": res,
+    }
+    mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+    mock_st.tabs.side_effect = lambda labels: [MagicMock() for _ in labels]
+
+    # Must execute cleanly without raising KeyError: 'fingerprints_match' or any other exception
+    with patch("dashboard.sentinel_view.st", mock_st):
+        render_sentinel_console([], str)
+
+
+def test_dashboard_render_sentinel_console_with_partial_or_empty_sim_data():
+    """Verify render_sentinel_console handles missing stages or None fields safely."""
+    from unittest.mock import MagicMock, patch
+    from dashboard.sentinel_view import render_sentinel_console
+
+    partial_data = {
+        "stage1_baseline": {"expected_fingerprint": None},
+        "stage3_detection": {"observed_fingerprint": None},
+        "stage4_dispatch_result": {},
+        "stage5_observable_proof": {},
+        "stage6_evidence": {},
+        "stage7_restoration": {"observed_fingerprint": None},
+        "stage8_authorized_resumption": {"data": None},
+    }
+
+    mock_st = MagicMock()
+    mock_st.button.return_value = False
+    mock_st.number_input.return_value = 50
+    mock_st.selectbox.return_value = "All"
+    mock_st.session_state = {
+        "last_refresh_time": None,
+        "sentinel_tamper_result": partial_data,
+        "sentinel_authorized_result": {"data": None},
+    }
+    mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+    mock_st.tabs.side_effect = lambda labels: [MagicMock() for _ in labels]
+
+    with patch("dashboard.sentinel_view.st", mock_st):
+        render_sentinel_console([], str)

@@ -174,6 +174,7 @@ class TrustResult:
     differences: list[str]
     explanation: str
     protected_execution_allowed: bool
+    fingerprints_match: bool = False
 
     @property
     def reason(self) -> str:
@@ -186,6 +187,7 @@ class TrustResult:
             "status": self.status,
             "expected_fingerprint": self.expected_fingerprint,
             "observed_fingerprint": self.observed_fingerprint,
+            "fingerprints_match": self.fingerprints_match,
             "differences": list(self.differences),
             "explanation": self.explanation,
             "reason": self.explanation,
@@ -386,6 +388,7 @@ def check_registry(observed_registry: Any = None) -> TrustResult:
             differences=["missing or malformed trusted registry baseline"],
             explanation="The trusted MCP tool registry baseline is missing or malformed.",
             protected_execution_allowed=False,
+            fingerprints_match=False,
         )
 
     try:
@@ -400,10 +403,16 @@ def check_registry(observed_registry: Any = None) -> TrustResult:
             differences=["MCP tool registry inspection failed or returned malformed data"],
             explanation="The declared MCP tool registry could not be verified safely.",
             protected_execution_allowed=False,
+            fingerprints_match=False,
         )
 
     differences = _differences(expected, observed)
-    if not differences and hmac.compare_digest(expected_fingerprint, observed_fingerprint):
+    fps_match = bool(
+        expected_fingerprint is not None
+        and observed_fingerprint is not None
+        and hmac.compare_digest(expected_fingerprint, observed_fingerprint)
+    )
+    if not differences and fps_match:
         return TrustResult(
             status="trusted",
             expected_fingerprint=expected_fingerprint,
@@ -411,6 +420,7 @@ def check_registry(observed_registry: Any = None) -> TrustResult:
             differences=[],
             explanation="The declared MCP tool registry matches the trusted baseline.",
             protected_execution_allowed=True,
+            fingerprints_match=True,
         )
 
     difference_text = "; ".join(differences) or "registry fingerprint mismatch"
@@ -421,6 +431,7 @@ def check_registry(observed_registry: Any = None) -> TrustResult:
         differences=differences or ["registry fingerprint mismatch"],
         explanation=f"MCP tool registry drift detected: {difference_text}.",
         protected_execution_allowed=False,
+        fingerprints_match=fps_match,
     )
 
 

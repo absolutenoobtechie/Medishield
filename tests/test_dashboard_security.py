@@ -187,3 +187,51 @@ def test_dashboard_verdict_uses_actual_gateway_decision():
     assert failed["decision"] == "blocked"
     assert failed["authorized"] is False
     assert failed["execution_complete"] is False
+
+
+def test_dashboard_advisory_audit_event_is_schema_compliant(dashboard_database):
+    """Verify that the audit event emitted by the advisory simulation button complies strictly with AUDIT_FIELDS."""
+    from guard.audit import record_audit_event
+
+    event_payload = {
+        "time": "2026-10-15T00:00:00Z",
+        "request_id": "REQ-TEST-ADVISORY-001",
+        "actor": "agent_1",
+        "tool": "update_order",
+        "action_type": "medication_order",
+        "approval_id": "APR-TEST-ADVISORY-001",
+        "decision": "warning",
+        "risk": "medium",
+        "rule": "unit case normalization notice",
+        "reason": "Submitted units 'MG' normalized to lowercase 'mg'. Approved action permitted under clinical oversight.",
+        "changed_fields": ["units"],
+        "state_changed": True,
+    }
+
+    row_id = record_audit_event(event_payload, connection=dashboard_database)
+    assert row_id > 0
+
+    saved = dashboard_database.execute(
+        "SELECT actor_id, decision, rule, state_changed FROM audit_events WHERE request_id = ?",
+        ("REQ-TEST-ADVISORY-001",),
+    ).fetchone()
+    assert saved is not None
+    assert saved["actor_id"] == "agent_1"
+    assert saved["decision"] == "warning"
+    assert saved["rule"] == "unit case normalization notice"
+    assert saved["state_changed"] == 1
+
+
+def test_dashboard_load_events_empty_database(tmp_path):
+    """Verify load_events handles empty database files or tables with 0 rows gracefully."""
+    from dashboard.app import load_events
+
+    empty_db = tmp_path / "empty.sqlite3"
+    conn = initialize_db(empty_db)
+    # Ensure audit_events table exists but has 0 rows
+    conn.execute("DELETE FROM audit_events")
+    conn.commit()
+    conn.close()
+
+    events, source = load_events(db_path=empty_db)
+    assert isinstance(events, list)

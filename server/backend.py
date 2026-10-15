@@ -5,15 +5,18 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
+from guard.approval import compute_approval_mac
 from guard.intent import action_hash, canonicalize_action
 from guard.models import ProtectedAction
+from privacy.auth import AuthorizationError, WorkspaceUser, require_permission
 
 from .db import DEFAULT_DB_PATH, PathLike, get_connection, init_db, initialize_db
 
 
 DATABASE_PATH: PathLike = DEFAULT_DB_PATH
+_GATEWAY_EXECUTION_TOKEN = object()
 
 
 @contextmanager
@@ -47,6 +50,8 @@ def _as_action(action: ProtectedAction | dict) -> ProtectedAction:
     if isinstance(action, ProtectedAction):
         return action
     if isinstance(action, dict):
+        if hasattr(ProtectedAction, "model_validate"):
+            return ProtectedAction.model_validate(action)
         return ProtectedAction.parse_obj(action)
     raise TypeError("action must be a ProtectedAction or a dictionary")
 
@@ -76,6 +81,8 @@ def create_approval(
     approver_id: str,
     ttl_minutes: object,
     connection: Optional[sqlite3.Connection] = None,
+    *,
+    trusted_user: WorkspaceUser | None = None,
 ) -> str:
     """Create one clinician approval and return its generated ID.
 
@@ -88,17 +95,26 @@ def create_approval(
     ttl = _positive_ttl(ttl_minutes)
 
     with _connection_scope(connection) as (current, owns_connection):
-        actor = current.execute(
-            "SELECT role FROM actors WHERE actor_id = ?",
-            (approver_id,),
-        ).fetchone()
-        if actor is None:
-            raise ValueError(f"Unknown approver: {approver_id}")
-        role = actor["role"] if isinstance(actor, sqlite3.Row) else actor[0]
-        if role != "clinician":
-            raise PermissionError("Only a clinician can create an approval")
+        if trusted_user is None:
+            raise PermissionError(
+                "Approval creation requires a server-authenticated clinician context"
+            )
+        try:
+            current_user = require_permission(current, trusted_user, "approval_confirm")
+        except AuthorizationError as exc:
+            raise PermissionError("Only an authenticated clinician can create an approval") from exc
+        if approver_id != current_user.actor_id:
+            raise PermissionError("The approver must match the authenticated clinician")
 
         validated_action = _as_action(action)
+        patient = current.execute(
+            "SELECT org_id FROM patients WHERE patient_id = ?",
+            (validated_action.patient_id,),
+        ).fetchone()
+        if patient is None or patient["org_id"] != current_user.org_id:
+            raise PermissionError(
+                "The approval action is outside the authenticated organization"
+            )
         action_json = canonicalize_action(validated_action)
         digest = action_hash(validated_action)
         if not isinstance(action_json, str) or not isinstance(digest, str):
@@ -110,22 +126,52 @@ def create_approval(
         except (OverflowError, ValueError):
             raise ValueError("ttl_minutes is too large") from None
         approval_id = f"APR-{uuid.uuid4().hex}"
+        created_at = _utc_timestamp(now)
+        expires_at = _utc_timestamp(expires)
+        approval_mac = compute_approval_mac(
+            approval_id=approval_id,
+            action_json=action_json,
+            action_hash=digest,
+            approver_id=approver_id,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
 
         current.execute(
             """
             INSERT INTO approvals(
                 approval_id, action_hash, action_json, approver_id,
-                created_at, expires_at, revoked, consumed
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+                created_at, expires_at, revoked, consumed, approval_mac
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
             """,
             (
                 approval_id,
                 digest,
                 action_json,
                 approver_id,
-                _utc_timestamp(now),
-                _utc_timestamp(expires),
+                created_at,
+                expires_at,
+                approval_mac,
             ),
+        )
+        from guard.audit import record_audit_event
+
+        record_audit_event(
+            {
+                "time": created_at,
+                "request_id": f"approval:{approval_id}",
+                "actor": approver_id,
+                "tool": "approval_store",
+                "action_type": "approval_created",
+                "approval_id": approval_id,
+                "decision": "allowed",
+                "risk": "low",
+                "rule": "clinician approval created",
+                "reason": "A clinician created a time-limited authenticated approval.",
+                "changed_fields": [],
+                "state_changed": False,
+            },
+            current,
         )
         if owns_connection:
             current.commit()
@@ -136,33 +182,75 @@ def create_approval(
 def revoke_approval(
     approval_id: str,
     connection: Optional[sqlite3.Connection] = None,
+    *,
+    trusted_user: WorkspaceUser | None = None,
 ) -> None:
     """Mark an existing approval revoked without deleting its audit history."""
 
     with _connection_scope(connection) as (current, owns_connection):
+        if trusted_user is None:
+            raise PermissionError(
+                "Approval revocation requires a server-authenticated clinician context"
+            )
+        try:
+            require_permission(current, trusted_user, "approval_confirm")
+        except AuthorizationError as exc:
+            raise PermissionError("Only an authenticated clinician can revoke an approval") from exc
         result = current.execute(
             "UPDATE approvals SET revoked = 1 WHERE approval_id = ?",
             (approval_id,),
         )
         if result.rowcount != 1:
             raise LookupError(f"Unknown approval: {approval_id}")
+        from guard.audit import record_audit_event
+
+        record_audit_event(
+            {
+                "time": _utc_timestamp(datetime.now(timezone.utc)),
+                "request_id": f"approval:{approval_id}:revoked",
+                "actor": "system",
+                "tool": "approval_store",
+                "action_type": "approval_revoked",
+                "approval_id": approval_id,
+                "decision": "allowed",
+                "risk": "low",
+                "rule": "approval revoked",
+                "reason": "The trusted backend marked the approval revoked.",
+                "changed_fields": ["revoked"],
+                "state_changed": False,
+            },
+            current,
+        )
         if owns_connection:
             current.commit()
 
 
 def get_state(
     connection: Optional[sqlite3.Connection] = None,
+    *,
+    trusted_user: WorkspaceUser | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     """Return ``{'orders': [...]}`` in deterministic order without writing state."""
 
     with _connection_scope(connection, seed=False) as (current, _):
+        if trusted_user is None:
+            raise PermissionError(
+                "Reading order state requires a server-authenticated context"
+            )
+        try:
+            current_user = require_permission(current, trusted_user, "patient_read")
+        except AuthorizationError as exc:
+            raise PermissionError("Order-state access is not authorized") from exc
         rows = current.execute(
             """
             SELECT order_id, patient_id, medication_id, dose, units,
                    route, frequency, duration
             FROM orders
+            JOIN patients ON patients.patient_id = orders.patient_id
+            WHERE patients.org_id = ?
             ORDER BY order_id
-            """
+            """,
+            (current_user.org_id,),
         ).fetchall()
         columns = (
             "order_id",
@@ -183,10 +271,79 @@ def get_state(
         return {"orders": orders}
 
 
+def get_patient_record(
+    patient_id: str,
+    connection: Optional[sqlite3.Connection] = None,
+    *,
+    trusted_user: WorkspaceUser | None = None,
+) -> dict[str, Any]:
+    """Retrieve one synthetic patient record and associated orders.
+
+    Protected clinical backend handler. Returns patient demographics and
+    current active orders.
+    """
+
+    with _connection_scope(connection, seed=True) as (current, _):
+        if trusted_user is None:
+            raise PermissionError(
+                "Patient-record access requires a server-authenticated context"
+            )
+        try:
+            current_user = require_permission(current, trusted_user, "patient_read")
+        except AuthorizationError as exc:
+            raise PermissionError("Patient-record access is not authorized") from exc
+        patient = current.execute(
+            "SELECT patient_id, name_synthetic, org_id FROM patients WHERE patient_id = ?",
+            (patient_id,),
+        ).fetchone()
+        if patient is None:
+            raise ValueError(f"Unknown synthetic patient: {patient_id}")
+        if patient["org_id"] != current_user.org_id:
+            raise PermissionError("Patient-record access is outside the authenticated organization")
+
+        orders = current.execute(
+            """
+            SELECT order_id, patient_id, medication_id, dose, units,
+                   route, frequency, duration
+            FROM orders
+            WHERE patient_id = ?
+            ORDER BY order_id
+            """,
+            (patient_id,),
+        ).fetchall()
+        columns = (
+            "order_id",
+            "patient_id",
+            "medication_id",
+            "dose",
+            "units",
+            "route",
+            "frequency",
+            "duration",
+        )
+        patient_dict = (
+            dict(patient)
+            if isinstance(patient, sqlite3.Row)
+            else {"patient_id": patient[0], "name_synthetic": patient[1]}
+        )
+        order_dicts = [
+            dict(order)
+            if isinstance(order, sqlite3.Row)
+            else dict(zip(columns, order))
+            for order in orders
+        ]
+        return {
+            "patient": patient_dict,
+            "orders": order_dicts,
+        }
+
+
 # SECURITY: Call only from guard/gateway.py inside its transaction.
 def apply_order(
     action: ProtectedAction | dict,
     connection: Optional[sqlite3.Connection] = None,
+    *,
+    _gateway_token: object = None,
 ) -> None:
     """Insert or update one synthetic order using the caller's transaction.
 
@@ -197,6 +354,8 @@ def apply_order(
 
     if connection is None:
         raise RuntimeError("apply_order requires the gateway transaction connection")
+    if _gateway_token is not _GATEWAY_EXECUTION_TOKEN:
+        raise PermissionError("order writes are restricted to the security gateway")
 
     validated_action = _as_action(action)
     connection.execute(
@@ -225,3 +384,42 @@ def apply_order(
             validated_action.duration,
         ),
     )
+
+
+
+def execute(
+    request,
+    connection: Optional[sqlite3.Connection] = None,
+    *,
+    _gateway_token: object = None,
+) -> None:
+    """Compatibility entry point used by the security gateway.
+
+    The gateway supplies its transaction connection so approval consumption,
+    order mutation, and audit persistence can commit or roll back together.
+    Direct callers cannot use this compatibility helper as a second execution
+    path; only the gateway's private capability token is accepted.
+    """
+
+    if _gateway_token is not _GATEWAY_EXECUTION_TOKEN:
+        raise PermissionError("backend execution is restricted to the security gateway")
+
+    close_after = connection is None
+    current = connection if connection is not None else get_connection(DATABASE_PATH)
+    try:
+        if not hasattr(request, "action"):
+            raise TypeError("request must expose a validated action")
+        apply_order(
+            request.action,
+            connection=current,
+            _gateway_token=_GATEWAY_EXECUTION_TOKEN,
+        )
+        if close_after:
+            current.commit()
+    except Exception:
+        if close_after:
+            current.rollback()
+        raise
+    finally:
+        if close_after:
+            current.close()

@@ -1,7 +1,9 @@
 .venv/
+.venv-bundled/
 __pycache__/
 *.py[cod]
 *.sqlite3
 .pytest_cache/
 logs/events.jsonl
+.medishield_vault/
 work/

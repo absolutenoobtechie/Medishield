@@ -4,12 +4,20 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
+try:
+    from pydantic import ConfigDict
+except ImportError:
+    ConfigDict = None
+
 
 class _StrictModel(BaseModel):
     """Base model that rejects fields not in the contract."""
 
-    class Config:
-        extra = "forbid"
+    if hasattr(BaseModel, "model_validate") and ConfigDict is not None:
+        model_config = ConfigDict(extra="forbid")
+    else:
+        class Config:
+            extra = "forbid"
 
 
 class ProtectedAction(_StrictModel):
@@ -29,6 +37,7 @@ class ExecutionRequest(_StrictModel):
     tool: str
     approval_id: str
     action: ProtectedAction
+    destination: Optional[str] = None
 
 
 class Decision(_StrictModel):

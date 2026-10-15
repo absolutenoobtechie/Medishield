@@ -47,30 +47,93 @@ def _validated_values(action: ProtectedAction | Mapping[str, Any]) -> dict[str, 
         if set(values) != set(_PROTECTED_FIELDS):
             raise ValueError("protected action fields do not match the contract")
         return values
-    except Exception as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError("protected action is invalid") from exc
 
 
+MAX_DOSE_STRING_LENGTH = 64
+MAX_DOSE_VALUE = Decimal("1000000")
+MAX_CANONICAL_DOSE_LENGTH = 128
+
+# These are the only unit spellings understood by the synthetic contract.
+# Aliases are explicit so an unknown unit cannot be guessed into equivalence.
+_UNIT_ALIASES = {
+    "mg": "mg",
+    "milligram": "mg",
+    "milligrams": "mg",
+    "synthetic-units": "synthetic-units",
+}
+
+
 def _normalize_dose(value: str) -> str:
+    """Normalize a medication dose string into canonical decimal representation.
+
+    Enforces fail-closed validation:
+    - Input must be a string within reasonable length bounds (<=64 chars).
+    - Value must be finite, strictly positive, and within clinical sanity limits (<=1,000,000).
+    - Arithmetic and conversion errors are safely converted to ValueError.
+    """
+    if not isinstance(value, str):
+        raise ValueError("dose must be a string")
+    trimmed = value.strip()
+    if not trimmed:
+        raise ValueError("dose must not be empty")
+    if len(trimmed) > MAX_DOSE_STRING_LENGTH:
+        raise ValueError(
+            f"dose string length ({len(trimmed)}) exceeds sanity bound of {MAX_DOSE_STRING_LENGTH}"
+        )
+
     try:
-        dose = Decimal(value)
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError("dose must be a finite decimal value") from exc
-    if not dose.is_finite():
-        raise ValueError("dose must be a finite decimal value")
-    if dose.is_zero():
-        return "0"
-    return format(dose.normalize(), "f")
+        dose = Decimal(trimmed)
+        if not dose.is_finite():
+            raise ValueError("dose must be a finite decimal value")
+        if dose <= 0:
+            raise ValueError("dose must be a positive decimal value")
+        if dose > MAX_DOSE_VALUE:
+            raise ValueError(
+                f"dose exceeds clinical sanity upper bound of {MAX_DOSE_VALUE}"
+            )
+        normalized = dose.normalize()
+        formatted = format(normalized, "f")
+        if len(formatted) > MAX_CANONICAL_DOSE_LENGTH:
+            raise ValueError("dose canonical form exceeds the representation bound")
+        return formatted
+    except (ArithmeticError, InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("dose must be a valid, finite, positive decimal value") from exc
 
 
 def canonicalize_action(action: ProtectedAction | Mapping[str, Any]) -> str:
     """Return sorted, compact JSON for the authoritative action fields only."""
 
     values = _validated_values(action)
+    text_fields = (
+        "patient_id",
+        "medication_id",
+        "units",
+        "route",
+        "frequency",
+        "order_id",
+    )
+    for field in text_fields:
+        if not isinstance(values[field], str) or not values[field].strip():
+            raise ValueError(f"{field} must be a non-empty string")
+    if values["duration"] is not None and (
+        not isinstance(values["duration"], str) or not values["duration"].strip()
+    ):
+        raise ValueError("duration must be null or a non-empty string")
     canonical = {field: values[field] for field in _PROTECTED_FIELDS}
     canonical["dose"] = _normalize_dose(canonical["dose"])
-    canonical["units"] = canonical["units"].lower()
-    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    unit_key = canonical["units"].strip().casefold()
+    if unit_key not in _UNIT_ALIASES:
+        raise ValueError("units must use a supported synthetic unit or alias")
+    canonical["units"] = _UNIT_ALIASES[unit_key]
+    return json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def action_hash(action: ProtectedAction | Mapping[str, Any]) -> str:
